@@ -1,23 +1,24 @@
-# run_pipeline.py
-# OT 版本 (路线甲): 直接在原始 patch 特征集合上做图-对-图的 Sinkhorn 最优传输,
-# 异常分数 = 测试图对正常参考集的 (最小 k 个 OT 距离的均值)。
-# 彻底甩掉 k-means 直方图 + 高斯/Mahalanobis 假设。
+# run_pipeline_gpu.py
+# GPU 版 k-means 词袋 + Mahalanobis, K 扫描 (full-data logical AD)
 #
-# 关键近似(都可调,都会打进报告):
-#   --patch-sample M   : 每张图随机采 M 个 patch 再算 OT(默认 512;2304=全用但慢 ~20x)
-#   --ref-sample R     : 参考集只用 R 张正常图(默认 0=全用)
-#   --topk-ref k       : 异常分数取"对参考集最小的 k 个 OT 距离"的均值(默认 5)
+# 相对上一版(位置增广)的改动:
+#   - 去掉位置增广(augment_with_position 等),回到纯语义 k-means,已验证对结果无实质影响。
+#   - --k 改为可接收多个值,一次扫多个 K,复用同一份缓存特征,不用重跑 DINO。
+#   - 每个 K 都要重新聚类(词表大小变了,直方图维度也变了),独立跑、横向对比。
 #
-# 用法(第一版,先看量级):
-#   python run_pipeline.py --obj pushpins breakfast_box --seeds 0 --patch-sample 512 --topk-ref 5
+# 用法:
+#   python run_pipeline_gpu.py --all --seeds 0 1 2 3 4 5 --k 64            # 复现 0.8331~0.8342 锚点
+#   python run_pipeline_gpu.py --all --seeds 0 1 2 3 4 5 --k 32 64 128 256 # 扫 K
 
 import os
 import argparse
 import numpy as np
 from datetime import datetime
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import torch
-from geomloss import SamplesLoss
+from sklearn.covariance import LedoitWolf
 from sklearn.metrics import roc_auc_score
 
 PROJECT_ROOT = "/mnt/nfs/xujy/logicdataset/dino_kmeans_logic"
@@ -25,11 +26,13 @@ CACHE_DIR = os.path.join(PROJECT_ROOT, "features_cache")
 RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
 OBJS = ["breakfast_box", "juice_bottle", "pushpins", "screw_bag", "splicing_connectors"]
 
-# Sinkhorn 参数
-SINKHORN_P = 2         # cost = 欧氏距离的 p 次方
-SINKHORN_BLUR = 0.05   # 正则强度(越小越接近精确 OT 但越慢/越不稳)
-SINKHORN_SCALING = 0.5 # 多尺度退火比例,0.5 是速度/精度折中
+KMEANS_FIT_SUBSAMPLE = 200_000
+KMEANS_ITERS = 100
+KMEANS_BATCH = 4096
+ASSIGN_CHUNK = 200_000
 
+
+# ----------------------------- 数据加载 -----------------------------
 
 def load_split_features(obj, split_name):
     d = os.path.join(CACHE_DIR, obj, split_name)
@@ -37,110 +40,179 @@ def load_split_features(obj, split_name):
     return [np.load(os.path.join(d, f)).astype(np.float32) for f in files]
 
 
-def subsample_patches(feat, m, rng):
-    """feat: [N, D] numpy. 随机采 m 个 patch(m<=0 或 m>=N 时全用)。"""
-    n = feat.shape[0]
-    if m <= 0 or m >= n:
-        return feat
-    idx = rng.choice(n, m, replace=False)
-    return feat[idx]
+# ----------------------------- GPU k-means -----------------------------
+
+def kmeans_gpu(X, k, seed, device, n_iters=KMEANS_ITERS, batch_size=KMEANS_BATCH,
+              subsample=KMEANS_FIT_SUBSAMPLE):
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    n = X.shape[0]
+    if n > subsample:
+        idx = torch.randperm(n, generator=g)[:subsample]
+        pool = X[idx]
+    else:
+        pool = X
+    n_pool = pool.shape[0]
+
+    init_idx = torch.randperm(n_pool, generator=g)[:k]
+    centroids = pool[init_idx].clone()
+    counts = torch.zeros(k, device=X.device)
+
+    for _ in range(n_iters):
+        bidx = torch.randint(0, n_pool, (min(batch_size, n_pool),), generator=g)
+        batch = pool[bidx]
+        assign = torch.cdist(batch, centroids).argmin(1)
+        sums = torch.zeros_like(centroids)
+        sums.index_add_(0, assign, batch)
+        cnts = torch.bincount(assign, minlength=k).to(centroids.dtype)
+        counts += cnts
+        mask = cnts > 0
+        if mask.any():
+            lr = (cnts[mask] / counts[mask]).unsqueeze(1)
+            centroids[mask] = (1 - lr) * centroids[mask] + lr * (sums[mask] / cnts[mask].unsqueeze(1))
+    return centroids
 
 
-def prepare_set(feats_list, m, rng, device):
-    """把一个 split 的每张图处理成 [M, D] 的 GPU tensor 列表。"""
-    out = []
-    for f in feats_list:
-        sub = subsample_patches(f, m, rng)
-        out.append(torch.from_numpy(sub).to(device))
-    return out
+def assign_gpu(X, centroids, chunk=ASSIGN_CHUNK):
+    n = X.shape[0]
+    labels = torch.empty(n, dtype=torch.long, device=X.device)
+    for s in range(0, n, chunk):
+        e = min(s + chunk, n)
+        labels[s:e] = torch.cdist(X[s:e], centroids).argmin(1)
+    return labels
 
 
-def ot_scores_for_split(test_sets, ref_sets, loss_fn, topk):
-    """对每张测试图,算它对所有参考图的 OT 距离,取最小 topk 个的均值当分数。"""
-    scores = np.zeros(len(test_sets))
-    for i, t in enumerate(test_sets):
-        dists = torch.empty(len(ref_sets), device=t.device)
-        for j, r in enumerate(ref_sets):
-            dists[j] = loss_fn(t, r)
-        k = min(topk, len(ref_sets))
-        scores[i] = torch.topk(dists, k, largest=False).values.mean().item()
-    return scores
+def build_histogram_gpu(feats_list, centroids, k, device):
+    counts_per_img = [f.shape[0] for f in feats_list]
+    big = torch.cat([torch.from_numpy(f).to(device) for f in feats_list], dim=0)
+    labels = assign_gpu(big, centroids)
+
+    hists = torch.zeros((len(feats_list), k), dtype=torch.float64, device=device)
+    off = 0
+    for i, n in enumerate(counts_per_img):
+        hists[i] = torch.bincount(labels[off:off + n], minlength=k).to(torch.float64)
+        off += n
+    return hists.cpu().numpy()
 
 
-def run_one_category(obj, seed, patch_sample, ref_sample, topk, device_str):
+# ----------------------------- 单类别流程 -----------------------------
+
+def run_one_category(obj, k, seed, device_str):
     device = torch.device(device_str)
-    rng = np.random.RandomState(seed)
-
     train_feats = load_split_features(obj, "train_good")
     good_feats = load_split_features(obj, "test_good")
     logical_feats = load_split_features(obj, "test_logical")
 
-    if ref_sample > 0 and ref_sample < len(train_feats):
-        ref_idx = rng.choice(len(train_feats), ref_sample, replace=False)
-        train_feats = [train_feats[i] for i in ref_idx]
+    train_tensor = torch.from_numpy(np.concatenate(train_feats, axis=0)).to(device)
+    centroids = kmeans_gpu(train_tensor, k, seed, device)
 
-    ref_sets = prepare_set(train_feats, patch_sample, rng, device)
-    good_sets = prepare_set(good_feats, patch_sample, rng, device)
-    logical_sets = prepare_set(logical_feats, patch_sample, rng, device)
+    train_hist = build_histogram_gpu(train_feats, centroids, k, device)
+    good_hist = build_histogram_gpu(good_feats, centroids, k, device)
+    logical_hist = build_histogram_gpu(logical_feats, centroids, k, device)
 
-    loss_fn = SamplesLoss("sinkhorn", p=SINKHORN_P, blur=SINKHORN_BLUR, scaling=SINKHORN_SCALING)
+    lw = LedoitWolf().fit(train_hist)
+    mean_vec = torch.from_numpy(lw.location_).to(device=device, dtype=torch.float64)
+    precision = torch.from_numpy(lw.get_precision()).to(device=device, dtype=torch.float64)
 
-    good_s = ot_scores_for_split(good_sets, ref_sets, loss_fn, topk)
-    logical_s = ot_scores_for_split(logical_sets, ref_sets, loss_fn, topk)
+    def maha(hist_np):
+        h = torch.from_numpy(hist_np).to(device=device, dtype=torch.float64)
+        diff = h - mean_vec
+        return torch.einsum("ij,jk,ik->i", diff, precision, diff).cpu().numpy()
 
+    good_s, logical_s = maha(good_hist), maha(logical_hist)
     y_true = np.concatenate([np.zeros(len(good_s)), np.ones(len(logical_s))])
     y_score = np.concatenate([good_s, logical_s])
-    auc = roc_auc_score(y_true, y_score)
-    return auc, len(ref_sets)
+    return roc_auc_score(y_true, y_score)
 
+
+# ----------------------------- 并行调度 -----------------------------
+
+def _worker(task):
+    obj, k, seed, gpu_id = task
+    if gpu_id >= 0:
+        torch.cuda.set_device(gpu_id)
+        device_str = f"cuda:{gpu_id}"
+    else:
+        device_str = "cpu"
+    auc = run_one_category(obj, k, seed, device_str)
+    return obj, seed, k, auc
+
+
+def run_all_jobs(objs, ks, seeds, device_pref, workers):
+    jobs = [(obj, seed, k) for k in ks for seed in seeds for obj in objs]
+    results = {k: {obj: {} for obj in objs} for k in ks}
+    n_gpus = 0 if device_pref == "cpu" else (torch.cuda.device_count() if torch.cuda.is_available() else 0)
+
+    if n_gpus >= 1:
+        tagged = [(obj, k, seed, i % n_gpus) for i, (obj, seed, k) in enumerate(jobs)]
+        max_workers = workers or n_gpus
+        ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
+            futs = [ex.submit(_worker, t) for t in tagged]
+            for fut in as_completed(futs):
+                obj, seed, k, auc = fut.result()
+                results[k][obj][seed] = auc
+                print(f"[k={k}][seed={seed}] {obj:22s}: {auc:.4f}", flush=True)
+    else:
+        for (obj, seed, k) in jobs:
+            _, _, _, auc = _worker((obj, k, seed, -1))
+            results[k][obj][seed] = auc
+            print(f"[k={k}][seed={seed}] {obj:22s}: {auc:.4f}", flush=True)
+
+    ordered = {k: {obj: [results[k][obj][s] for s in seeds] for obj in objs} for k in ks}
+    return ordered
+
+
+# ----------------------------- 主入口 -----------------------------
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--obj", nargs="+", default=["pushpins", "breakfast_box"])
+    ap.add_argument("--obj", choices=OBJS)
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--k", type=int, nargs="+", default=[64],
+                    help="视觉词数量列表,如 32 64 128 256")
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
-    ap.add_argument("--patch-sample", type=int, default=512,
-                    help="每张图采样多少 patch 算 OT(2304=全用但慢)")
-    ap.add_argument("--ref-sample", type=int, default=0,
-                    help="参考集用多少张正常图(0=全用)")
-    ap.add_argument("--topk-ref", type=int, default=5,
-                    help="异常分数取对参考集最小的 k 个 OT 距离的均值")
     ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    ap.add_argument("--workers", type=int, default=0)
     args = ap.parse_args()
 
-    device_str = "cuda:0" if (args.device != "cpu" and torch.cuda.is_available()) else "cpu"
+    objs = OBJS if args.all else ([args.obj] if args.obj else None)
+    if objs is None:
+        print("请指定 --obj <category> 或 --all")
+        return
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda 但无可用 GPU")
+
     os.makedirs(RESULTS_DIR, exist_ok=True)
+    results = run_all_jobs(objs, args.k, args.seeds, args.device, args.workers)
 
-    results = {obj: [] for obj in args.obj}
-    ref_used = {}
-    import time
-    for seed in args.seeds:
-        for obj in args.obj:
-            t0 = time.time()
-            auc, n_ref = run_one_category(obj, seed, args.patch_sample,
-                                          args.ref_sample, args.topk_ref, device_str)
-            dt = time.time() - t0
-            results[obj].append(auc)
-            ref_used[obj] = n_ref
-            print(f"[seed={seed}] {obj:22s}: AUROC={auc:.4f}  (n_ref={n_ref}, {dt:.1f}s)", flush=True)
-
+    n_gpus = 0 if args.device == "cpu" else (torch.cuda.device_count() if torch.cuda.is_available() else 0)
     lines = [
-        f"# OT (Sinkhorn) image-to-image on raw patch features (full-data logical AD)",
-        f"# DINOv2-with-registers-giant, patch_sample={args.patch_sample}, "
-        f"ref_sample={args.ref_sample or 'all'}, topk_ref={args.topk_ref}",
-        f"# sinkhorn p={SINKHORN_P}, blur={SINKHORN_BLUR}, scaling={SINKHORN_SCALING}, "
-        f"seeds={args.seeds}, device={device_str}, time={datetime.now().isoformat(timespec='seconds')}",
+        f"# GPU k-means bag-of-words + Mahalanobis, K sweep (full-data logical AD)",
+        f"# DINOv2-with-registers-giant, anisotropic resize 672, mean layers [-18,-12]",
+        f"# k values={args.k}, seeds={args.seeds}, device={'%d GPU'%n_gpus if n_gpus else 'CPU'}, "
+        f"time={datetime.now().isoformat(timespec='seconds')}",
         "",
-        f"{'category':22s}  {'mean':>7s}  {'std':>6s}  per-seed",
     ]
-    for obj in args.obj:
-        arr = np.array(results[obj])
-        lines.append(f"{obj:22s}  {arr.mean():.4f}  {arr.std():.4f}  "
-                     f"[{', '.join(f'{a:.4f}' for a in arr)}]")
+    for k in args.k:
+        lines.append(f"=== k = {k} ===")
+        lines.append(f"{'category':22s}  {'mean':>7s}  {'std':>6s}  per-seed")
+        macro_ps = np.zeros(len(args.seeds))
+        for obj in objs:
+            arr = np.array(results[k][obj])
+            lines.append(f"{obj:22s}  {arr.mean():.4f}  {arr.std():.4f}  "
+                         f"[{', '.join(f'{a:.4f}' for a in arr)}]")
+        if args.all:
+            for si in range(len(args.seeds)):
+                macro_ps[si] = np.mean([results[k][obj][si] for obj in objs])
+            lines.append(f"{'MACRO':22s}  {macro_ps.mean():.4f}  {macro_ps.std():.4f}  "
+                         f"[{', '.join(f'{m:.4f}' for m in macro_ps)}]")
+        lines.append("")
 
     report = "\n".join(lines)
     print("\n" + report)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(RESULTS_DIR, f"ot_ps{args.patch_sample}_top{args.topk_ref}_{stamp}.txt")
+    k_tag = "_".join(str(x) for x in args.k)
+    out_path = os.path.join(RESULTS_DIR, f"kmeans_gpu_ksweep{k_tag}_{stamp}.txt")
     with open(out_path, "w") as f:
         f.write(report + "\n")
     print(f"\nSaved to {out_path}")
