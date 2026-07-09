@@ -24,7 +24,7 @@
 #     (如果 Fused 提升不明显,说明 A、B 抓到的可能是同一种信号,双分支意义不大)。
 #
 # 用法(先跑 cache_sam3_foreground_masks.py 缓存前景权重,再跑这个):
-#   python run_pipeline.py --obj pushpins --seeds 0 1
+#   python dual_branch_bow_pipeline.py --obj pushpins --seeds 0 1
 
 import os
 import argparse
@@ -90,21 +90,45 @@ def fit_branch_A(train_feats, k, seed):
     return fit_kmeans(pooled, k, seed)
 
 
-def fit_branch_B(train_feats, train_weights, k, seed, threshold):
-    """只用前景 patch 独立拟合词表。"""
+def detect_coverage_outliers(train_weights, z_thresh=2.5):
+    """基于 train_good 自身前景覆盖率分布做统计离群检测,两端都标:
+    覆盖率异常高 -> 大概率是背景/前景检测失败、退化成整图前景(比如这次遇到的
+    screw_bag/pushpins 没检出 tray/bag 的情况);覆盖率异常低 -> 前景基本没被
+    检出。只用 train_good 自己的统计量,不碰任何测试信息,不需要任何模型判断——
+    纯统计、确定性,可以在论文方法部分精确描述这个剔除规则。
+    返回 bool 数组,True=离群(不参与词表/协方差拟合,但仍然正常参与打分,不丢数据)。"""
+    cov = np.array([w.mean() for w in train_weights])
+    mu, sd = cov.mean(), cov.std()
+    if sd < 1e-8:
+        return np.zeros(len(cov), dtype=bool)
+    z = (cov - mu) / sd
+    return np.abs(z) > z_thresh
+
+
+def fit_branch_B(train_feats, train_weights, k, seed, threshold, outlier_mask=None):
+    """只用前景 patch 独立拟合词表。outlier_mask 为 True 的图(覆盖率统计离群,
+    大概率是分割失败、整图变前景)不参与拟合——不这样做的话,一张失败图能贡献出
+    接近全图 2304 个 patch,而正常图可能只贡献两三百个,词表会被这一张图主导。"""
+    if outlier_mask is None:
+        outlier_mask = np.zeros(len(train_feats), dtype=bool)
     fg_chunks = []
-    for feat, w in zip(train_feats, train_weights):
+    for feat, w, is_outlier in zip(train_feats, train_weights, outlier_mask):
+        if is_outlier:
+            continue
         keep = w > threshold
         if keep.any():
             fg_chunks.append(feat[keep])
     if not fg_chunks:
         raise RuntimeError(
-            "所有 train_good 图在当前阈值下都没有前景 patch,"
-            "检查 mask 缓存是否正常,或调低 FG_FIT_THRESHOLD")
+            "剔除离群图后,没有 train_good 图在当前阈值下还有前景 patch,"
+            "检查 mask 缓存是否正常,或调低 FG_FIT_THRESHOLD / z_thresh")
     pooled = np.concatenate(fg_chunks, axis=0)
     n_total = sum(f.shape[0] for f in train_feats)
+    n_excluded = int(outlier_mask.sum())
     print(f"    分支B独立拟合: 前景 patch {pooled.shape[0]}/{n_total} "
-          f"({pooled.shape[0]/n_total*100:.1f}%) 参与词表拟合", flush=True)
+          f"({pooled.shape[0]/n_total*100:.1f}%) 参与词表拟合"
+          f"{f',剔除覆盖率离群图 {n_excluded}/{len(train_feats)} 张' if n_excluded else ''}",
+          flush=True)
     return fit_kmeans(pooled, k, seed)
 
 
@@ -130,8 +154,20 @@ def build_weighted_histogram(km, feats, weights, k):
 
 # ----------------------------- LedoitWolf + Mahalanobis(带 train 自身分数,便于做标准化) -----------------------------
 
-def fit_ledoitwolf_and_score(train_hist, good_hist, logical_hist):
-    lw = LedoitWolf().fit(train_hist)
+def fit_ledoitwolf_and_score(train_hist, good_hist, logical_hist, train_fit_mask=None):
+    """train_fit_mask 为 True 的图(覆盖率离群)不参与 LedoitWolf 拟合,避免污染协方差
+    估计;但这些图仍然正常参与打分(train_s 对全部图计算),不丢数据,只是不让它们
+    的坏统计进入模型本身。"""
+    if train_fit_mask is not None and train_fit_mask.any():
+        fit_hist = train_hist[~train_fit_mask]
+        if fit_hist.shape[0] < 2:
+            print(f"    [WARN] 剔除离群图后 train_good 只剩 {fit_hist.shape[0]} 张,"
+                  f"不够拟合 LedoitWolf,回退为不剔除", flush=True)
+            fit_hist = train_hist
+    else:
+        fit_hist = train_hist
+
+    lw = LedoitWolf().fit(fit_hist)
     mean_vec = lw.location_
     precision = lw.get_precision()
 
@@ -139,7 +175,7 @@ def fit_ledoitwolf_and_score(train_hist, good_hist, logical_hist):
         diff = hist - mean_vec
         return np.einsum("ij,jk,ik->i", diff, precision, diff)
 
-    train_s = maha(train_hist)     # 用于后续 z-score 标准化的参考分布
+    train_s = maha(train_hist)     # 全部图都要打分(离群图也要),用于后续 z-score 标准化
     good_s = maha(good_hist)
     logical_s = maha(logical_hist)
     return train_s, good_s, logical_s
@@ -169,7 +205,7 @@ def branch_correlation(good_za, logical_za, good_zb, logical_zb):
 
 # ----------------------------- 单个 seed 的完整流程 -----------------------------
 
-def run_one_seed(obj, k, seed, threshold, cache_dir, mask_cache_dir):
+def run_one_seed(obj, k, seed, threshold, cache_dir, mask_cache_dir, outlier_z_thresh=2.5):
     train_feats, train_w = load_split(obj, "train_good", cache_dir, mask_cache_dir)
     good_feats, good_w = load_split(obj, "test_good", cache_dir, mask_cache_dir)
     logical_feats, logical_w = load_split(obj, "test_logical", cache_dir, mask_cache_dir)
@@ -183,13 +219,20 @@ def run_one_seed(obj, k, seed, threshold, cache_dir, mask_cache_dir):
         train_hist_a, good_hist_a, logical_hist_a)
     auc_a = auroc(good_sa, logical_sa)
 
-    # ---- 分支 B:独立前景词袋 ----
-    km_b = fit_branch_B(train_feats, train_w, k, seed, threshold)
+    # ---- 分支 B:独立前景词袋(剔除覆盖率离群图,防止个别 SAM3 分割失败图
+    #      污染词表拟合和协方差估计。只用 train_good 自己的覆盖率分布判断,
+    #      不碰测试标签,不需要任何模型判断,纯统计、确定性) ----
+    outlier_mask = detect_coverage_outliers(train_w, z_thresh=outlier_z_thresh)
+    if outlier_mask.any():
+        print(f"    [离群检测] train_good 中 {int(outlier_mask.sum())}/{len(train_w)} "
+              f"张图前景覆盖率统计离群(z>{outlier_z_thresh}),已从分支B的词表/协方差"
+              f"拟合中剔除,但仍正常参与打分", flush=True)
+    km_b = fit_branch_B(train_feats, train_w, k, seed, threshold, outlier_mask=outlier_mask)
     train_hist_b = build_weighted_histogram(km_b, train_feats, train_w, k)
     good_hist_b = build_weighted_histogram(km_b, good_feats, good_w, k)
     logical_hist_b = build_weighted_histogram(km_b, logical_feats, logical_w, k)
     train_sb, good_sb, logical_sb = fit_ledoitwolf_and_score(
-        train_hist_b, good_hist_b, logical_hist_b)
+        train_hist_b, good_hist_b, logical_hist_b, train_fit_mask=outlier_mask)
     auc_b = auroc(good_sb, logical_sb)
 
     # ---- 融合:各分支用 train_good 自己的分数做 z-score ----
@@ -203,7 +246,7 @@ def run_one_seed(obj, k, seed, threshold, cache_dir, mask_cache_dir):
 
     # 融合方式二:取较大值。对"一个分支弱/带噪声"这种情况通常比相加更稳健——
     # 噪声分支只有在它比另一个分支更"确信异常"时才会被采纳,不会把强分支的
-    # 高分拉低。用和 crop 聚合代码里 --agg max 同一个思路,零额外算力
+    # 高分拉低。用和你 crop 聚合代码里 --agg max 同一个思路,零额外算力
     # (复用同一批已经算好的 z-score,不用重新拟合)。
     good_max = np.maximum(good_za, good_zb)
     logical_max = np.maximum(logical_za, logical_zb)
@@ -225,6 +268,10 @@ def main():
     ap.add_argument("--k", type=int, default=DEFAULT_K)
     ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1])
     ap.add_argument("--fg-threshold", type=float, default=FG_FIT_THRESHOLD)
+    ap.add_argument("--outlier-z-thresh", type=float, default=2.5,
+                    help="分支B词表/协方差拟合时,train_good 前景覆盖率 z-score 超过"
+                         "此阈值的图会被剔除出拟合(仍正常参与打分),用来防止个别 SAM3 "
+                         "分割失败图污染词表和协方差估计")
     ap.add_argument("--cache-dir", default=CACHE_DIR)
     ap.add_argument("--mask-cache-dir", default=MASK_CACHE_DIR)
     args = ap.parse_args()
@@ -235,7 +282,8 @@ def main():
     for seed in args.seeds:
         print(f"\n=== {args.obj} seed={seed} ===", flush=True)
         auc_a, auc_b, auc_sum, auc_max, corr = run_one_seed(
-            args.obj, args.k, seed, args.fg_threshold, args.cache_dir, args.mask_cache_dir)
+            args.obj, args.k, seed, args.fg_threshold, args.cache_dir, args.mask_cache_dir,
+            outlier_z_thresh=args.outlier_z_thresh)
         print(f"  A (全图词袋, 现有 baseline)     : {auc_a:.4f}", flush=True)
         print(f"  B (独立前景词袋)                : {auc_b:.4f}", flush=True)
         print(f"  Fused-sum (A、B z-score 相加)   : {auc_sum:.4f}", flush=True)
