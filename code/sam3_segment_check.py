@@ -1,5 +1,5 @@
 # sam3_segment_check.py
-# 用 SAM 3 文本概念提示验证 pushpins 图钉实例分割质量。
+# 用 SAM 3 文本概念提示验证各类别实例/前景分割质量。
 # 只做肉眼诊断,不接入现有 anomaly pipeline。
 #
 # 权重建议从 ModelScope 下载到本地,然后用 --checkpoint 指向 sam3.pt:
@@ -25,10 +25,19 @@ PROJECT_ROOT = "/mnt/nfs/xujy/logicdataset/dino_kmeans_logic"
 DEFAULT_SAM3_ROOT = os.path.join(PROJECT_ROOT, "third_party", "sam3")
 DEFAULT_OUT_DIR = os.path.join(PROJECT_ROOT, "results", "sam3_check")
 
-SAMPLE_IMAGES = [
-    ("pushpins", "train/good", "000.png"),
-    ("pushpins", "test/logical_anomalies", "000.png"),
-]
+SPLITS = {
+    "train_good": "train/good",
+    "test_good": "test/good",
+    "test_logical": "test/logical_anomalies",
+}
+
+PROMPTS = {
+    "breakfast_box": "box",
+    "juice_bottle": "bottle",
+    "pushpins": "pushpin",
+    "screw_bag": "screw",
+    "splicing_connectors": "connector",
+}
 
 
 def resolve_checkpoint(path):
@@ -95,6 +104,22 @@ def inference_context(device):
     return nullcontext()
 
 
+def list_images(obj, split):
+    d = os.path.join(DATASET_ROOT, obj, split)
+    if not os.path.isdir(d):
+        return []
+    files = [f for f in os.listdir(d) if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+    files.sort()
+    return files
+
+
+def select_evenly(files, n):
+    if n <= 0 or len(files) <= n:
+        return files
+    idx = np.linspace(0, len(files) - 1, n, dtype=int)
+    return [files[i] for i in np.unique(idx)]
+
+
 def run_one(processor, image_path, prompt, out_path, device):
     image = Image.open(image_path).convert("RGB")
     with inference_context(device):
@@ -133,10 +158,18 @@ def main():
                     help="ModelScope 下载目录中的 sam3.pt 路径; 也可用 SAM3_CHECKPOINT 环境变量")
     ap.add_argument("--sam3-root", default=DEFAULT_SAM3_ROOT)
     ap.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
-    ap.add_argument("--prompt", default="pushpin")
+    ap.add_argument("--obj", nargs="+", default=["pushpins"],
+                    choices=sorted(PROMPTS.keys()))
+    ap.add_argument("--prompt", default=None,
+                    help="覆盖默认 prompt。只适合一次跑一个 --obj 时使用")
+    ap.add_argument("--n-per-split", type=int, default=6,
+                    help="每个 split 均匀采样多少张图做可视化")
     ap.add_argument("--confidence", type=float, default=0.5)
     ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     args = ap.parse_args()
+
+    if args.prompt is not None and len(args.obj) != 1:
+        raise SystemExit("--prompt 覆盖只支持单个 --obj; 多类别请使用脚本内 PROMPTS 映射")
 
     checkpoint = resolve_checkpoint(args.checkpoint)
     device = "cuda" if args.device != "cpu" and torch.cuda.is_available() else "cpu"
@@ -156,20 +189,28 @@ def main():
         confidence_threshold=args.confidence,
     )
 
-    for obj, split, fname in SAMPLE_IMAGES:
-        img_path = os.path.join(DATASET_ROOT, obj, split, fname)
-        if not os.path.exists(img_path):
-            print(f"[skip] not found: {img_path}", flush=True)
-            continue
-        out_name = f"{obj}_{split.replace('/', '_')}_{fname}"
-        out_path = os.path.join(args.out_dir, out_name)
-        n_instances = run_one(processor, img_path, args.prompt, out_path, device)
-        print(
-            f"{obj}/{split}/{fname}: detected {n_instances} instances "
-            f"for prompt '{args.prompt}'",
-            flush=True,
-        )
-        print(f"  saved: {out_path}", flush=True)
+    for obj in args.obj:
+        prompt = args.prompt or PROMPTS[obj]
+        obj_out_dir = os.path.join(args.out_dir, obj)
+        os.makedirs(obj_out_dir, exist_ok=True)
+        print(f"\n=== {obj}, prompt='{prompt}' ===", flush=True)
+
+        for split_name, split_subdir in SPLITS.items():
+            files = select_evenly(list_images(obj, split_subdir), args.n_per_split)
+            print(f"[{split_name}] visualizing {len(files)} images", flush=True)
+            for fname in files:
+                img_path = os.path.join(DATASET_ROOT, obj, split_subdir, fname)
+                if not os.path.exists(img_path):
+                    print(f"[skip] not found: {img_path}", flush=True)
+                    continue
+                out_name = f"{split_name}_{fname}"
+                out_path = os.path.join(obj_out_dir, out_name)
+                n_instances = run_one(processor, img_path, prompt, out_path, device)
+                print(
+                    f"  {obj}/{split_subdir}/{fname}: detected {n_instances} instances",
+                    flush=True,
+                )
+                print(f"    saved: {out_path}", flush=True)
 
 
 if __name__ == "__main__":
