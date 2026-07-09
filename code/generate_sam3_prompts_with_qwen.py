@@ -2,25 +2,29 @@
 # 用 Qwen3-VL-8B-Instruct 给每个类别自动生成 SAM3 该用的文本 prompt,
 # 替代"每个类别都要人工跑 sam3_segment_check.py 肉眼挑 prompt"这一步。
 #
+# 范式(第二版,取代直接列举前景内容物的第一版): 让 Qwen 描述【背景/托底材料】
+# (黑背景、白托盘、塑料袋、金属网),下游取反得到前景,而不是直接描述前景内容物。
+# 原因是实测教训: 直接列举前景内容物这条路,juice_bottle("cherry juice")和
+# splicing_connectors("network cable")都在 SAM3 上失败(0 实例)——这类内容物
+# 短语是小众组合词,SAM3 认不出来。而背景材料是极通用的视觉概念,识别可靠得多。
+# 这也是 SALAD 论文本身的机制:先定位背景/容器,取反得到前景。
+#
 # 关键设计依据(查证过,不是拍脑袋): SAM3 的文本编码器是围绕"短名词短语"
-# (noun phrase)训练的,官方例子都是 "yellow school bus"、"striped cat" 这种
-# 2-4 词的短语,不是完整句子。Meta 自己的博客也明确说 MLLM 配合 SAM3 使用时,
-# 标准做法是让 MLLM 生成的长描述"蒸馏"成短概念短语再喂给 SAM3,不能把一整段
-# 场景描述直接丢给它。所以这份脚本不是让 Qwen3-VL"描述图片",而是强约束它
-# 只输出一个短语列表,格式直接对齐 SAM3 的输入习惯。
+# (noun phrase)训练的,官方例子都是 "yellow school bus"、"black background" 这种
+# 2-4 词的短语,不是完整句子。所以这份脚本强约束 Qwen 只输出一个短语列表,
+# 格式直接对齐 SAM3 的输入习惯。
 #
-# 免费自检: pushpins 你已经人工验证过 prompt="pushpin"(sam3_segment_check.py)。
-# 这份脚本也会对 pushpins 跑一遍自动生成,和已验证的人工结果做对比打印出来——
-# 如果自动生成的结果和人工验证的一致/接近,说明这套自动化流程本身是可信的;
-# 如果对不上,说明自动化这条路本身有问题,不该先急着用它去处理其它 4 个类别。
+# 自检: pushpins 有人工验证过的前景词 "pushpin"(sam3_segment_check.py)。
+# 这份脚本对 pushpins 也跑一遍背景描述生成,检查 Qwen 有没有把 "pushpin" 这个
+# 已知前景词错当成背景描述出来——这是范式反转后更有意义的自检方式。
+# pushpins 本身仍然用人工验证过的直接前景 prompt(HUMAN_VALIDATED),不走反转。
 #
-# 产出: 一份 JSON manifest,每个类别对应一个"短语列表"(不是单个字符串,
-# 因为像 breakfast_box、screw_bag 这种多组件类别,可能需要好几个短语才能
-# 覆盖所有前景部件类型,SAM3 一次只处理一个概念)。
+# 产出: 一份 JSON manifest,每个类别对应 {"mode": "background", "phrases": [...]}。
+# 下游 cache_sam3_foreground_masks.py 需要读这个 mode 字段,把并集 mask 取反。
 #
 # 重要: 这份 manifest 是"未经人工验证"的产出,不能直接当成 VALIDATED_PROMPTS
 # 那样的可信来源使用——用之前必须先对每个类别至少跑一次 sam3_segment_check.py
-# 肉眼确认分割质量,这是你自己定的验证流程,这份脚本不改变这一点。
+# 肉眼确认背景真的被分割干净、没有把前景内容物也框进去。
 #
 # 用法:
 #   python generate_sam3_prompts_with_qwen.py --n-ref-images 2
@@ -44,45 +48,48 @@ OUT_DIR = os.path.join(PROJECT_ROOT, "results", "qwen_sam3_prompts")
 ALL_OBJS = ["breakfast_box", "juice_bottle", "pushpins", "screw_bag", "splicing_connectors"]
 
 # 你已经人工用 sam3_segment_check.py 肉眼验证过的 prompt,只用来做自检对比,
-# 不会被这份脚本覆盖或替代。
+# 不会被这份脚本覆盖或替代。这些是"直接前景"prompt,不走背景反转这条路——
+# pushpins 已经验证直接前景效果很好,没必要为了范式统一牺牲已验证的方案。
 HUMAN_VALIDATED = {
     "pushpins": ["pushpin"],
 }
 
-# 目标已明确:前景 vs 背景。前景分支只需要把"该关注的东西"和背景(黑底/托盘/网格/塑料袋)
-# 分开,不追求部件级精细分割。所以这里让 Qwen 列出"能盖全前景的物件词",可以是多个词
-# (下游取并集盖全前景),但明确禁止输出会把背景也一起盖进去的【容器整体词】——
-# 比如 breakfast_box 的正确答案是里面的食物(orange/peach/granola/nut),不是 "box"(会连托盘一起盖掉)。
-FORBIDDEN_WHOLE_CONTAINER_WORDS = {
-    "box", "tray", "container", "bag", "package", "packaging", "plate",
-    "carton", "case", "background", "surface", "grid", "mesh", "plastic bag",
-}
-
+# 范式改变的原因(实测教训,不是拍脑袋): 直接让 Qwen 列举"前景内容物"这条路对
+# juice_bottle("cherry juice"/"orange juice")和 splicing_connectors("network cable")
+# 都失败了——SAM3 在 0 实例。这类内容物短语往往是小众组合词,SAM3 文本编码器没有
+# 强对应。而背景/托底材料(黑背景、白托盘、塑料袋、金属网)是极其通用的视觉概念,
+# 无论是 Qwen 描述还是 SAM3 识别都容易得多。SALAD 论文本身也是这个思路:先定位
+# 背景/容器,再取反得到前景,而不是直接对前景内容物做开放词表分割。
+# 所以这里让 Qwen 描述背景/托底材料,下游取反得到前景,不再要求穷举内容物种类。
 SYSTEM_PROMPT = (
     "You are a vision assistant configuring an open-vocabulary segmentation model (SAM3) "
     "for an industrial visual-inspection pipeline. SAM3 accepts short English noun phrases "
-    "(2-4 words each, e.g. \"pushpin\", \"screw\", \"orange fruit\") -- it does NOT understand "
-    "full sentences.\n"
-    "GOAL: separate the meaningful FOREGROUND CONTENTS from the background. The background "
-    "includes the black backdrop, the tray/box/bag/container that merely HOLDS the contents, "
-    "and any support surface or mesh. These must NOT be segmented.\n"
-    "Instead, list the noun phrases for the actual CONTENT items placed in/on the product "
-    "(e.g. the individual food items inside a tray, the individual hardware parts inside a bag). "
-    "Choose phrases that together COVER ALL the foreground contents -- use several phrases if "
-    "there are several distinct content types.\n"
-    "STRICT RULE: never output a word for the holder/container itself (box, tray, bag, "
-    "container, plate, background, surface, mesh). If the product is a bottle or jar whose "
-    "body IS the inspected object (nothing meaningful inside to separate), then the object "
-    "name itself is acceptable.\n"
+    "(2-4 words each, e.g. \"black background\", \"wire mesh\", \"plastic bag\") -- it does "
+    "NOT understand full sentences.\n"
+    "GOAL: segment the BACKGROUND / holder so it can be INVERTED to get the foreground "
+    "contents (this is more reliable than naming the foreground contents directly, since "
+    "foreground content items are often unusual compound nouns that segmentation models "
+    "struggle with, while the backdrop/holder material is a common, easy-to-recognize "
+    "visual concept).\n"
+    "Describe the BACKGROUND / supporting material -- the black backdrop, the tray/bag/box "
+    "material that merely HOLDS the contents, or the support surface/mesh underneath -- "
+    "NOT the inspected contents themselves. Use several phrases if the background has "
+    "multiple distinct materials (e.g. both a black backdrop AND a visible tray/bag).\n"
+    "EXCEPTION: if the product itself IS a single self-contained object with nothing "
+    "meaningful placed inside/on it to separate (e.g. a bottle, where the bottle body is "
+    "the entire inspected object), then only the black backdrop behind it is background -- "
+    "do not name the object itself as background.\n"
     "Respond with ONLY a JSON array of short noun phrases, no explanation, no markdown fences.\n"
-    "Example (breakfast tray): [\"orange\", \"peach\", \"granola\", \"nut\"]\n"
-    "Example (hardware bag): [\"screw\", \"nut\", \"washer\"]"
+    "Example (food tray): [\"white tray\", \"black background\"]\n"
+    "Example (hardware bag): [\"plastic bag\", \"black background\"]\n"
+    "Example (bottle on black backdrop): [\"black background\"]"
 )
 
 USER_PROMPT = (
     "These images show a normal (defect-free) sample of one product category. "
-    "List the foreground CONTENT item types (not the holder/container/background) as a "
-    "JSON array of short noun phrases that together cover all the foreground."
+    "List the BACKGROUND / holder material types (not the inspected contents) as a "
+    "JSON array of short noun phrases, so the background can later be inverted to "
+    "isolate the foreground contents."
 )
 
 
@@ -157,18 +164,6 @@ def parse_phrase_list(raw_text):
     return None
 
 
-def filter_container_words(phrases):
-    """去掉会把背景一起盖住的容器整体词(box/tray/bag/...)。返回 (保留的短语, 被去掉的短语)。
-    这是对 prompt 生成的第一道兜底:即使 Qwen 没听话给了 'box',也不会让它进入 SAM3。"""
-    kept, dropped = [], []
-    for p in phrases:
-        if p.strip().lower() in FORBIDDEN_WHOLE_CONTAINER_WORDS:
-            dropped.append(p)
-        else:
-            kept.append(p)
-    return kept, dropped
-
-
 def generate_for_object(model, processor, obj, n_ref_images, seed, max_new_tokens):
     images, picked_files = sample_reference_images(obj, n_ref_images, seed)
     print(f"\n[{obj}] 参考图: {picked_files}", flush=True)
@@ -182,22 +177,20 @@ def generate_for_object(model, processor, obj, n_ref_images, seed, max_new_token
               f"需要人工检查上面的原始输出、调整 prompt 或换更大的模型", flush=True)
         return None
 
-    phrases, dropped = filter_container_words(phrases)
-    if dropped:
-        print(f"  [WARN] 已过滤掉容器整体词(会连背景一起盖住): {dropped}", flush=True)
-    if not phrases:
-        print(f"  [WARN] 过滤后没有可用的前景短语了(Qwen 只给了容器词),该类别跳过,"
-              f"需要人工检查原始输出或调整 prompt", flush=True)
-        return None
+    print(f"  解析出的背景短语: {phrases}", flush=True)
 
-    print(f"  解析出的短语: {phrases}", flush=True)
-
+    # 自检:如果该类别有人工验证过的"前景"词(比如 pushpins 的 "pushpin"),
+    # 检查 Qwen 有没有把真正的前景内容物错当成背景描述出来——这是范式反转后
+    # 更有意义的自检方式,而不是像旧版那样比较"前景词是否重合"。
     if obj in HUMAN_VALIDATED:
-        human = HUMAN_VALIDATED[obj]
-        overlap = set(p.lower() for p in phrases) & set(h.lower() for h in human)
-        print(f"  [自检] 人工已验证的 prompt: {human}  "
-              f"{'✓ 有重合,自动化结果和人工验证一致' if overlap else '✗ 无重合,需要人工复核这条自动化流程'}",
-              flush=True)
+        fg_words = set(h.lower() for h in HUMAN_VALIDATED[obj])
+        bg_words = set(p.lower() for p in phrases)
+        overlap = fg_words & bg_words
+        if overlap:
+            print(f"  [自检失败] Qwen 把已知前景词 {overlap} 当成背景描述出来了,"
+                  f"这条自动化流程对这个类别不可信,需要人工复核。", flush=True)
+        else:
+            print(f"  [自检通过] 生成的背景短语没有和已知前景词 {fg_words} 冲突。", flush=True)
 
     return phrases
 
@@ -225,7 +218,9 @@ def main():
         if phrases is None:
             failed.append(obj)
         else:
-            manifest[obj] = phrases
+            # mode="background": 下游 cache_sam3_foreground_masks.py 要把这些短语的
+            # 并集 mask 取反,才是前景。这是范式核心,不能丢在存盘这一步。
+            manifest[obj] = {"mode": "background", "phrases": phrases}
 
     out_path = os.path.join(args.out_dir, "generated_prompts.json")
     with open(out_path, "w") as f:
@@ -237,9 +232,10 @@ def main():
     if failed:
         print(f"\n[WARN] 以下类别解析失败,manifest 里没有它们,需要单独处理: {failed}")
     print(
-        "\n重要提醒: 这份 manifest 是 Qwen3-VL 自动生成的,还没有人工肉眼验证过。"
-        "\n用它跑 cache_sam3_foreground_masks.py 之前,先对每个类别至少跑一次"
-        "\nsam3_segment_check.py 确认分割质量,不要跳过这一步直接批量生产 mask。"
+        "\n重要提醒: 这份 manifest 是 Qwen3-VL 自动生成的背景描述,还没有人工肉眼验证过,"
+        "\n且需要 cache_sam3_foreground_masks.py 取反才能得到前景。用它之前,先对每个类别"
+        "\n至少跑一次 sam3_segment_check.py(用这些短语查 SAM3,肉眼确认背景真的被分割干净、"
+        "\n没有把前景内容物也框进去),不要跳过这一步直接批量生产 mask。"
     )
 
 

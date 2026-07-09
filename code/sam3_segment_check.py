@@ -138,7 +138,20 @@ def run_sam3_prompt(processor, image, prompt, device):
     return masks_np > 0.5, boxes, scores
 
 
-def run_one(processor, image_path, prompts, out_path, device):
+def masks_to_union(masks_np, image):
+    if masks_np.shape[0] == 0:
+        return np.zeros((image.height, image.width), dtype=bool)
+    return masks_np.any(axis=0)
+
+
+def blend_binary_mask(image, mask, color=(255, 80, 40), alpha=0.55):
+    overlay = np.array(image).astype(np.float32)
+    color_arr = np.array(color, dtype=np.float32)
+    overlay[mask] = overlay[mask] * (1 - alpha) + color_arr * alpha
+    return overlay.astype(np.uint8)
+
+
+def run_one(processor, image_path, prompts, mode, out_path, device):
     image = Image.open(image_path).convert("RGB")
 
     all_masks = []
@@ -162,8 +175,10 @@ def run_one(processor, image_path, prompts, out_path, device):
     boxes_np = np.concatenate(all_boxes, axis=0) if all_boxes else None
     scores_np = np.concatenate(all_scores, axis=0) if all_scores else None
     n_instances = int(masks_np.shape[0])
+    union_mask = masks_to_union(masks_np, image)
+    foreground_mask = ~union_mask if mode == "background" else union_mask
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     axes[0].imshow(image)
     axes[0].set_title(os.path.basename(image_path))
     axes[0].axis("off")
@@ -185,13 +200,19 @@ def run_one(processor, image_path, prompts, out_path, device):
                 axes[1].text(x0, max(0, y0 - 4), f"{float(score):.2f}",
                              color="lime", fontsize=8,
                              bbox={"facecolor": "black", "alpha": 0.5, "pad": 1})
-    axes[1].set_title(f"{n_instances} instances for {prompts}")
+    axes[1].set_title(f"{n_instances} {mode} instances for {prompts}")
     axes[1].axis("off")
+
+    fg_overlay = blend_binary_mask(image, foreground_mask)
+    axes[2].imshow(fg_overlay)
+    axes[2].set_title("foreground used downstream" if mode == "background"
+                      else "foreground prompt union")
+    axes[2].axis("off")
 
     plt.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
-    return n_instances, per_prompt_counts
+    return n_instances, per_prompt_counts, float(foreground_mask.mean())
 
 
 def load_generated_prompts():
@@ -204,13 +225,16 @@ def load_generated_prompts():
 
 def resolve_prompts(obj, cli_prompts, use_generated):
     if cli_prompts:
-        return cli_prompts
+        return cli_prompts, "foreground"
     if use_generated:
         manifest = load_generated_prompts()
         if obj not in manifest:
             raise KeyError(f"{obj} not found in {GENERATED_PROMPTS_PATH}")
-        return manifest[obj]
-    return PROMPTS[obj]
+        entry = manifest[obj]
+        if isinstance(entry, dict):
+            return entry["phrases"], entry.get("mode", "background")
+        return entry, "foreground"
+    return PROMPTS[obj], "foreground"
 
 
 def main():
@@ -223,6 +247,8 @@ def main():
                     choices=sorted(PROMPTS.keys()))
     ap.add_argument("--prompts", nargs="+", default=None,
                     help="覆盖默认 prompt,支持多个短语并集")
+    ap.add_argument("--mode", choices=["foreground", "background"], default=None,
+                    help="--prompts 显式指定时声明这些短语是前景还是背景;背景会取反显示前景")
     ap.add_argument("--use-generated-prompts", action="store_true",
                     help="从 results/qwen_sam3_prompts/generated_prompts.json 读取每类 prompt 列表")
     ap.add_argument("--n-per-split", type=int, default=6,
@@ -253,10 +279,12 @@ def main():
     )
 
     for obj in args.obj:
-        prompts = resolve_prompts(obj, args.prompts, args.use_generated_prompts)
+        prompts, mode = resolve_prompts(obj, args.prompts, args.use_generated_prompts)
+        if args.prompts is not None and args.mode is not None:
+            mode = args.mode
         obj_out_dir = os.path.join(args.out_dir, obj)
         os.makedirs(obj_out_dir, exist_ok=True)
-        print(f"\n=== {obj}, prompts={prompts} ===", flush=True)
+        print(f"\n=== {obj}, prompts={prompts}, mode={mode} ===", flush=True)
 
         for split_name, split_subdir in SPLITS.items():
             files = select_evenly(list_images(obj, split_subdir), args.n_per_split)
@@ -268,10 +296,11 @@ def main():
                     continue
                 out_name = f"{split_name}_{fname}"
                 out_path = os.path.join(obj_out_dir, out_name)
-                n_instances, per_prompt_counts = run_one(processor, img_path, prompts, out_path, device)
+                n_instances, per_prompt_counts, fg_cov = run_one(
+                    processor, img_path, prompts, mode, out_path, device)
                 print(
                     f"  {obj}/{split_subdir}/{fname}: detected {n_instances} instances "
-                    f"{per_prompt_counts}",
+                    f"{per_prompt_counts}, foreground_coverage={fg_cov:.3f}",
                     flush=True,
                 )
                 print(f"    saved: {out_path}", flush=True)

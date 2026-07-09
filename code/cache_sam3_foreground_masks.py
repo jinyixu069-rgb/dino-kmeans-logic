@@ -1,9 +1,12 @@
 # cache_sam3_foreground_masks.py
 # 缓存 SAM3 前景 mask,给 k-means 词袋去噪用(而不是做实例计数统计)。
 #
-# 做的事很简单:对每张图,用文本提示分割出所有匹配实例,取【并集】得到一张前景/背景二值图,
-# 各向异性缩到 48x48(和 DINO anisotropic-672 预处理对齐)得到软覆盖率权重,存盘。
-# 这份权重只是给下游 mask_weighted_bow_pipeline.py 用来:
+# 做的事:对每张图,用文本提示分割出所有匹配实例,取【并集】。
+#   mode='foreground': 并集直接就是前景 mask(比如 pushpins 的 "pushpin")。
+#   mode='background': 并集是背景/容器 mask,取反后才是前景(比如 breakfast_box
+#                       的 "white tray"+"black background" 取反得到全部食物)。
+# 再各向异性缩到 48x48(和 DINO anisotropic-672 预处理对齐)得到软覆盖率权重,存盘。
+# 这份权重给下游 dual_branch_bow_pipeline.py / triple_branch_bow_pipeline.py 用来:
 #   1) 筛选哪些 patch 能参与 k-means 拟合(词表去噪)
 #   2) 给直方图统计加权(计数去噪)
 # 不做任何打分,不产出 AUROC —— 纯预处理缓存,类似 features_cache 的地位。
@@ -12,6 +15,7 @@
 #
 # 用法:
 #   python cache_sam3_foreground_masks.py --checkpoint /path/to/sam3.pt --obj pushpins
+#   python cache_sam3_foreground_masks.py --obj breakfast_box --use-generated-prompts
 
 import os
 import sys
@@ -131,14 +135,16 @@ def list_images(obj, split_subdir):
     return fs
 
 
-def process_split(processor, obj, split_name, split_subdir, prompts, device,
+def process_split(processor, obj, split_name, split_subdir, prompts, mode, device,
                   mask_cache_dir, overwrite):
     out_dir = os.path.join(mask_cache_dir, obj, split_name)
     os.makedirs(out_dir, exist_ok=True)
     files = list_images(obj, split_subdir)
 
-    coverage = []  # 每张图前景权重占比,用来发现"整图检不到前景"的异常情况
-    counts = []    # 每张图 SAM3 检出的实例数量(所有 prompt 累加),给分支 C 用
+    coverage = []  # 每张图前景权重占比(已经过 mode 处理,统一是"前景"含义)
+    counts = []    # SAM3 检出的实例数量(所有 prompt 累加)。mode='background' 时这个数字
+                   # 是"背景材料的实例数",不是前景内容物数量,不能直接喂给分支 C,
+                   # 只是留着做诊断参考,下面会打印明确提醒。
     for f in files:
         basename = f.rsplit(".", 1)[0]
         out_path = os.path.join(out_dir, basename + ".npy")
@@ -150,6 +156,8 @@ def process_split(processor, obj, split_name, split_subdir, prompts, device,
             img_path = os.path.join(DATASET_ROOT, obj, split_subdir, f)
             image = Image.open(img_path).convert("RGB")
             mask, n_inst = segment_union_mask(processor, image, prompts, device)
+            if mode == "background":
+                mask = ~mask  # 取反:背景 mask -> 前景 mask,这是这个范式的核心一步
             w = mask_to_grid_weights(mask)
             np.save(out_path, w.astype(np.float32))
             np.save(count_path, np.array(n_inst, dtype=np.int32))
@@ -166,38 +174,40 @@ def process_split(processor, obj, split_name, split_subdir, prompts, device,
         cnt = np.array(counts)
         mean_cov = cov.mean()
         print(f"  [{obj}/{split_name}] n={len(cov)}  "
-              f"前景覆盖率 mean={mean_cov:.3f} min={cov.min():.3f} max={cov.max():.3f}  "
-              f"实例数 mean={cnt.mean():.2f} median={np.median(cnt):.1f} "
-              f"min={cnt.min()} max={cnt.max()}",
+              f"前景覆盖率(mode={mode}) mean={mean_cov:.3f} min={cov.min():.3f} max={cov.max():.3f}  "
+              f"{'背景' if mode == 'background' else '前景'}实例数 mean={cnt.mean():.2f} "
+              f"median={np.median(cnt):.1f} min={cnt.min()} max={cnt.max()}"
+              f"{'  [注意: mode=background 时这是背景材料实例数,不是前景内容物数量,分支C不要用]' if mode == 'background' else ''}",
               flush=True)
-        # 覆盖率闸门:只在 train_good 上判断(它最能反映"正常前景该占多大"),给警告不做删除
+        # 覆盖率闸门:只在 train_good 上判断,判断的是取反之后的最终前景覆盖率,
+        # 所以不管 mode 是 foreground 还是 background,同一套阈值含义一致。
         if split_name == "train_good":
             if mean_cov > FG_COVERAGE_HIGH:
                 print(f"  [闸门警告] {obj}: train_good 前景覆盖率 {mean_cov:.3f} > {FG_COVERAGE_HIGH},"
-                      f"prompt 很可能把容器/背景也盖进去了(前景≈全图),前景分支会退化成"
-                      f"带噪声的全图词袋。建议换更具体的前景内容物 prompt,别用容器整体词。",
-                      flush=True)
+                      f"前景≈全图,{'背景 prompt 可能没盖住真正的背景区域' if mode=='background' else '前景 prompt 很可能把容器/背景也盖进去了'},"
+                      f"前景分支会退化成带噪声的全图词袋。", flush=True)
             elif mean_cov < FG_COVERAGE_LOW:
                 print(f"  [闸门警告] {obj}: train_good 前景覆盖率 {mean_cov:.3f} < {FG_COVERAGE_LOW},"
-                      f"前景基本没被盖住,prompt 可能分不到目标或只盖到很小一部分,"
-                      f"检查分割质量或补充 prompt 短语。", flush=True)
+                      f"前景基本没被盖住,{'背景 prompt 可能把前景内容物也当成背景框住了' if mode=='background' else 'prompt 可能分不到目标'},"
+                      f"检查分割质量或调整 prompt。", flush=True)
     return coverage, counts
 
 
 def resolve_prompts(obj, cli_prompts, use_generated):
-    """按优先级解析该类别要用的 prompt 列表,并打印清楚来源可信度:
-    1. --prompts 显式指定(用户自己确认过,最高优先级)
-    2. VALIDATED_PROMPTS 里人工用 sam3_segment_check.py 肉眼验证过的
+    """按优先级解析该类别要用的 (prompt 列表, mode),并打印清楚来源可信度:
+    1. --prompts 显式指定(用户自己确认过,最高优先级,视为直接前景 mode='foreground')
+    2. VALIDATED_PROMPTS 里人工用 sam3_segment_check.py 肉眼验证过的(mode='foreground')
     3. --use-generated-prompts 时,回退到 Qwen3-VL 自动生成、未经人工验证的 manifest
+       (mode='background',需要下游取反才是前景)
     3 号来源会打印醒目警告,不会假装它和人工验证的一样可信。"""
     if cli_prompts:
-        print(f"[{obj}] 使用命令行显式指定的 prompt: {cli_prompts}", flush=True)
-        return cli_prompts
+        print(f"[{obj}] 使用命令行显式指定的 prompt(直接前景): {cli_prompts}", flush=True)
+        return cli_prompts, "foreground"
 
     if obj in VALIDATED_PROMPTS:
         prompts = VALIDATED_PROMPTS[obj]
-        print(f"[{obj}] 使用人工已验证的 prompt: {prompts}", flush=True)
-        return prompts
+        print(f"[{obj}] 使用人工已验证的 prompt(直接前景): {prompts}", flush=True)
+        return prompts, "foreground"
 
     if use_generated:
         if not os.path.exists(GENERATED_PROMPTS_PATH):
@@ -209,11 +219,14 @@ def resolve_prompts(obj, cli_prompts, use_generated):
         if obj not in manifest:
             raise SystemExit(f"[{obj}] 不在自动生成的 manifest 里,该类别的 prompt 生成失败过,"
                              f"需要单独处理: {GENERATED_PROMPTS_PATH}")
-        prompts = manifest[obj]
-        print(f"[{obj}] [WARN] 使用 Qwen3-VL 自动生成、尚未人工验证的 prompt: {prompts}\n"
-              f"  强烈建议先用 sam3_segment_check.py 肉眼确认分割质量,再信任这批缓存结果。",
-              flush=True)
-        return prompts
+        entry = manifest[obj]
+        prompts, mode = entry["phrases"], entry.get("mode", "background")
+        print(f"[{obj}] [WARN] 使用 Qwen3-VL 自动生成、尚未人工验证的背景描述 "
+              f"(mode={mode}): {prompts}\n"
+              f"  下游会把这些短语的并集 mask 取反当作前景。强烈建议先用 "
+              f"sam3_segment_check.py 肉眼确认背景真的被分割干净、没有连带框住前景内容物,"
+              f"再信任这批缓存结果。", flush=True)
+        return prompts, mode
 
     raise SystemExit(
         f"[{obj}] 没有已验证的提示词。可以: (1) 用 --prompts 显式指定并手动验证过;"
@@ -229,6 +242,9 @@ def main():
     ap.add_argument("--prompts", nargs="+", default=None,
                     help="显式指定一个或多个文本提示词(空格分隔)。不给则按"
                          "VALIDATED_PROMPTS -> --use-generated-prompts 的顺序解析")
+    ap.add_argument("--mode", choices=["foreground", "background"], default=None,
+                    help="--prompts 显式指定时,配套说明这些短语是直接前景还是背景"
+                         "(背景会取反)。不给默认 foreground(直接前景,兼容旧用法)")
     ap.add_argument("--use-generated-prompts", action="store_true",
                     help="没有人工验证过的 prompt 时,回退到 Qwen3-VL 自动生成的"
                          "manifest(未经人工验证,建议先跑 sam3_segment_check.py 复核)")
@@ -240,13 +256,18 @@ def main():
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
-    prompts = resolve_prompts(args.obj, args.prompts, args.use_generated_prompts)
+    if args.prompts:
+        prompts, mode = args.prompts, (args.mode or "foreground")
+        print(f"[{args.obj}] 使用命令行显式指定的 prompt(mode={mode}): {prompts}", flush=True)
+    else:
+        prompts, mode = resolve_prompts(args.obj, None, args.use_generated_prompts)
 
     checkpoint = resolve_checkpoint(args.checkpoint)
     device = "cuda" if args.device != "cpu" and torch.cuda.is_available() else "cpu"
 
     build_sam3_image_model, Sam3Processor, bpe_path = import_sam3(args.sam3_root)
-    print(f"Loading SAM3 from {checkpoint} on {device}, prompts={prompts} ...", flush=True)
+    print(f"Loading SAM3 from {checkpoint} on {device}, prompts={prompts}, mode={mode} ...",
+          flush=True)
     model = build_sam3_image_model(
         bpe_path=bpe_path, checkpoint_path=checkpoint,
         load_from_HF=False, device=device,
@@ -255,7 +276,7 @@ def main():
 
     for split_name, split_subdir in SPLITS.items():
         print(f"\n[{args.obj}/{split_name}]", flush=True)
-        process_split(processor, args.obj, split_name, split_subdir, prompts, device,
+        process_split(processor, args.obj, split_name, split_subdir, prompts, mode, device,
                       args.mask_cache_dir, args.overwrite)
 
     print(f"\nDone. Foreground weight masks cached under "
