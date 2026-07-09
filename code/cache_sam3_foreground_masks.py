@@ -3,7 +3,7 @@
 #
 # 做的事很简单:对每张图,用文本提示分割出所有匹配实例,取【并集】得到一张前景/背景二值图,
 # 各向异性缩到 48x48(和 DINO anisotropic-672 预处理对齐)得到软覆盖率权重,存盘。
-# 这份权重只是给下游 run_pipeline.py 用来:
+# 这份权重只是给下游 mask_weighted_bow_pipeline.py 用来:
 #   1) 筛选哪些 patch 能参与 k-means 拟合(词表去噪)
 #   2) 给直方图统计加权(计数去噪)
 # 不做任何打分,不产出 AUROC —— 纯预处理缓存,类似 features_cache 的地位。
@@ -15,6 +15,7 @@
 
 import os
 import sys
+import json
 import argparse
 from contextlib import nullcontext
 
@@ -29,6 +30,14 @@ DEFAULT_MASK_CACHE_DIR = os.path.join(PROJECT_ROOT, "features_cache_fgmask")
 
 GRID = 48  # 672 / 14,和 DINO 特征 patch 排列对齐
 
+# 前景覆盖率闸门:目标是"前景 vs 背景",所以并集 mask 的覆盖率既不该太高也不该太低。
+# 太高(>HIGH):基本可以判定 prompt 把容器/背景也盖进去了(比如 breakfast_box 的 "box"),
+#              前景分支会退化成"带噪声的全图词袋",这次实测 breakfast_box B 掉到 0.68 就是这个原因。
+# 太低(<LOW):前景没盖全(比如 screw_bag 只框到 2 个螺丝漏了螺母垫圈),需要补 prompt。
+# 这两个阈值是拍的经验值,只用来"在批量跑之前给出警告",不改变任何缓存结果,不做自动删除。
+FG_COVERAGE_HIGH = 0.70
+FG_COVERAGE_LOW = 0.02
+
 SPLITS = {
     "train_good": "train/good",
     "test_good": "test/good",
@@ -37,9 +46,14 @@ SPLITS = {
 
 # 只有 pushpins 的提示词是你已经用 sam3_segment_check.py 肉眼确认过的。
 # 其它类别先跑 sam3_segment_check.py 确认分割质量,再把验证过的提示词加进这里。
+# 值统一用列表:多组件类别(比如 screw_bag)可能需要好几个短语才能覆盖所有前景部件,
+# SAM3 一次只处理一个概念,这里对每个短语各查一次 SAM3,取并集。
 VALIDATED_PROMPTS = {
-    "pushpins": "pushpin",
+    "pushpins": ["pushpin"],
 }
+
+GENERATED_PROMPTS_PATH = os.path.join(
+    PROJECT_ROOT, "results", "qwen_sam3_prompts", "generated_prompts.json")
 
 
 def resolve_checkpoint(path):
@@ -70,21 +84,34 @@ def inference_context(device):
     return nullcontext()
 
 
-def segment_union_mask(processor, image, prompt, device):
-    """返回原图分辨率的前景并集 bool mask [H,W](所有匹配实例取并集)。没检测到实例时返回全 False。"""
-    with inference_context(device):
-        state = processor.set_image(image)
-        processor.reset_all_prompts(state)
-        state = processor.set_text_prompt(prompt=prompt, state=state)
+def segment_union_mask(processor, image, prompts, device):
+    """对 prompts 列表里每个短语各查一次 SAM3,取所有短语、所有实例的并集 mask,
+    实例数量按短语累加(比如 screw_bag 用 ["screw","nut","washer"],就是三次查询
+    各自的实例数相加)。返回 (原图分辨率 bool mask [H,W], 总实例数量 n_instances)。
+    没检测到任何实例时返回全 False mask 和 n_instances=0。"""
+    union = None
+    total_n = 0
+    for prompt in prompts:
+        with inference_context(device):
+            state = processor.set_image(image)
+            processor.reset_all_prompts(state)
+            state = processor.set_text_prompt(prompt=prompt, state=state)
 
-    masks = state.get("masks")
-    if masks is None or masks.shape[0] == 0:
-        return np.zeros((image.height, image.width), dtype=bool)
+        masks = state.get("masks")
+        if masks is None or masks.shape[0] == 0:
+            continue
 
-    masks_np = masks.detach().cpu().numpy()
-    if masks_np.ndim == 4:  # [N,1,H,W] -> [N,H,W]
-        masks_np = masks_np[:, 0]
-    return (masks_np > 0.5).any(axis=0)
+        masks_np = masks.detach().cpu().numpy()
+        if masks_np.ndim == 4:  # [N,1,H,W] -> [N,H,W]
+            masks_np = masks_np[:, 0]
+        masks_np = masks_np > 0.5
+        total_n += int(masks_np.shape[0])
+        this_union = masks_np.any(axis=0)
+        union = this_union if union is None else (union | this_union)
+
+    if union is None:
+        union = np.zeros((image.height, image.width), dtype=bool)
+    return union, total_n
 
 
 def mask_to_grid_weights(mask_2d, grid=GRID):
@@ -104,37 +131,94 @@ def list_images(obj, split_subdir):
     return fs
 
 
-def process_split(processor, obj, split_name, split_subdir, prompt, device,
+def process_split(processor, obj, split_name, split_subdir, prompts, device,
                   mask_cache_dir, overwrite):
     out_dir = os.path.join(mask_cache_dir, obj, split_name)
     os.makedirs(out_dir, exist_ok=True)
     files = list_images(obj, split_subdir)
 
     coverage = []  # 每张图前景权重占比,用来发现"整图检不到前景"的异常情况
+    counts = []    # 每张图 SAM3 检出的实例数量(所有 prompt 累加),给分支 C 用
     for f in files:
         basename = f.rsplit(".", 1)[0]
         out_path = os.path.join(out_dir, basename + ".npy")
-        if not overwrite and os.path.exists(out_path):
+        count_path = os.path.join(out_dir, basename + "_count.npy")
+        if not overwrite and os.path.exists(out_path) and os.path.exists(count_path):
             w = np.load(out_path)
+            n_inst = int(np.load(count_path))
         else:
             img_path = os.path.join(DATASET_ROOT, obj, split_subdir, f)
             image = Image.open(img_path).convert("RGB")
-            mask = segment_union_mask(processor, image, prompt, device)
+            mask, n_inst = segment_union_mask(processor, image, prompts, device)
             w = mask_to_grid_weights(mask)
             np.save(out_path, w.astype(np.float32))
+            np.save(count_path, np.array(n_inst, dtype=np.int32))
 
         cov = float(w.mean())
         coverage.append(cov)
+        counts.append(n_inst)
         if cov < 1e-3:
             print(f"  [WARN] {obj}/{split_name}/{basename}: 前景覆盖率≈0,"
-                  f"该图 SAM3 可能没检出任何 '{prompt}' 实例", flush=True)
+                  f"该图 SAM3 可能没检出任何 {prompts} 实例", flush=True)
 
     if coverage:
         cov = np.array(coverage)
+        cnt = np.array(counts)
+        mean_cov = cov.mean()
         print(f"  [{obj}/{split_name}] n={len(cov)}  "
-              f"前景覆盖率 mean={cov.mean():.3f} min={cov.min():.3f} max={cov.max():.3f}",
+              f"前景覆盖率 mean={mean_cov:.3f} min={cov.min():.3f} max={cov.max():.3f}  "
+              f"实例数 mean={cnt.mean():.2f} median={np.median(cnt):.1f} "
+              f"min={cnt.min()} max={cnt.max()}",
               flush=True)
-    return coverage
+        # 覆盖率闸门:只在 train_good 上判断(它最能反映"正常前景该占多大"),给警告不做删除
+        if split_name == "train_good":
+            if mean_cov > FG_COVERAGE_HIGH:
+                print(f"  [闸门警告] {obj}: train_good 前景覆盖率 {mean_cov:.3f} > {FG_COVERAGE_HIGH},"
+                      f"prompt 很可能把容器/背景也盖进去了(前景≈全图),前景分支会退化成"
+                      f"带噪声的全图词袋。建议换更具体的前景内容物 prompt,别用容器整体词。",
+                      flush=True)
+            elif mean_cov < FG_COVERAGE_LOW:
+                print(f"  [闸门警告] {obj}: train_good 前景覆盖率 {mean_cov:.3f} < {FG_COVERAGE_LOW},"
+                      f"前景基本没被盖住,prompt 可能分不到目标或只盖到很小一部分,"
+                      f"检查分割质量或补充 prompt 短语。", flush=True)
+    return coverage, counts
+
+
+def resolve_prompts(obj, cli_prompts, use_generated):
+    """按优先级解析该类别要用的 prompt 列表,并打印清楚来源可信度:
+    1. --prompts 显式指定(用户自己确认过,最高优先级)
+    2. VALIDATED_PROMPTS 里人工用 sam3_segment_check.py 肉眼验证过的
+    3. --use-generated-prompts 时,回退到 Qwen3-VL 自动生成、未经人工验证的 manifest
+    3 号来源会打印醒目警告,不会假装它和人工验证的一样可信。"""
+    if cli_prompts:
+        print(f"[{obj}] 使用命令行显式指定的 prompt: {cli_prompts}", flush=True)
+        return cli_prompts
+
+    if obj in VALIDATED_PROMPTS:
+        prompts = VALIDATED_PROMPTS[obj]
+        print(f"[{obj}] 使用人工已验证的 prompt: {prompts}", flush=True)
+        return prompts
+
+    if use_generated:
+        if not os.path.exists(GENERATED_PROMPTS_PATH):
+            raise SystemExit(
+                f"[{obj}] 没有人工验证过的 prompt,且找不到自动生成的 manifest: "
+                f"{GENERATED_PROMPTS_PATH}\n先跑 generate_sam3_prompts_with_qwen.py。")
+        with open(GENERATED_PROMPTS_PATH) as f:
+            manifest = json.load(f)
+        if obj not in manifest:
+            raise SystemExit(f"[{obj}] 不在自动生成的 manifest 里,该类别的 prompt 生成失败过,"
+                             f"需要单独处理: {GENERATED_PROMPTS_PATH}")
+        prompts = manifest[obj]
+        print(f"[{obj}] [WARN] 使用 Qwen3-VL 自动生成、尚未人工验证的 prompt: {prompts}\n"
+              f"  强烈建议先用 sam3_segment_check.py 肉眼确认分割质量,再信任这批缓存结果。",
+              flush=True)
+        return prompts
+
+    raise SystemExit(
+        f"[{obj}] 没有已验证的提示词。可以: (1) 用 --prompts 显式指定并手动验证过;"
+        f"(2) 先跑 sam3_segment_check.py 肉眼确认后加进 VALIDATED_PROMPTS;"
+        f"(3) 加 --use-generated-prompts 使用 Qwen3-VL 自动生成的(未验证,风险自负)。")
 
 
 def main():
@@ -142,8 +226,12 @@ def main():
     ap.add_argument("--obj", default="pushpins",
                     choices=["breakfast_box", "juice_bottle", "pushpins",
                              "screw_bag", "splicing_connectors"])
-    ap.add_argument("--prompt", default=None,
-                    help="文本提示词。不给则用已验证映射(目前只有 pushpins->'pushpin')")
+    ap.add_argument("--prompts", nargs="+", default=None,
+                    help="显式指定一个或多个文本提示词(空格分隔)。不给则按"
+                         "VALIDATED_PROMPTS -> --use-generated-prompts 的顺序解析")
+    ap.add_argument("--use-generated-prompts", action="store_true",
+                    help="没有人工验证过的 prompt 时,回退到 Qwen3-VL 自动生成的"
+                         "manifest(未经人工验证,建议先跑 sam3_segment_check.py 复核)")
     ap.add_argument("--checkpoint", default=None)
     ap.add_argument("--sam3-root", default=DEFAULT_SAM3_ROOT)
     ap.add_argument("--mask-cache-dir", default=DEFAULT_MASK_CACHE_DIR)
@@ -152,17 +240,13 @@ def main():
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
-    prompt = args.prompt or VALIDATED_PROMPTS.get(args.obj)
-    if prompt is None:
-        raise SystemExit(
-            f"[{args.obj}] 没有已验证的提示词。先用 sam3_segment_check.py 肉眼确认分割质量,"
-            f"验证过后用 --prompt 显式指定。")
+    prompts = resolve_prompts(args.obj, args.prompts, args.use_generated_prompts)
 
     checkpoint = resolve_checkpoint(args.checkpoint)
     device = "cuda" if args.device != "cpu" and torch.cuda.is_available() else "cpu"
 
     build_sam3_image_model, Sam3Processor, bpe_path = import_sam3(args.sam3_root)
-    print(f"Loading SAM3 from {checkpoint} on {device}, prompt='{prompt}' ...", flush=True)
+    print(f"Loading SAM3 from {checkpoint} on {device}, prompts={prompts} ...", flush=True)
     model = build_sam3_image_model(
         bpe_path=bpe_path, checkpoint_path=checkpoint,
         load_from_HF=False, device=device,
@@ -171,11 +255,12 @@ def main():
 
     for split_name, split_subdir in SPLITS.items():
         print(f"\n[{args.obj}/{split_name}]", flush=True)
-        process_split(processor, args.obj, split_name, split_subdir, prompt, device,
+        process_split(processor, args.obj, split_name, split_subdir, prompts, device,
                       args.mask_cache_dir, args.overwrite)
 
     print(f"\nDone. Foreground weight masks cached under "
-          f"{os.path.join(args.mask_cache_dir, args.obj)}/<split>/<basename>.npy", flush=True)
+          f"{os.path.join(args.mask_cache_dir, args.obj)}/<split>/<basename>.npy, "
+          f"instance counts cached alongside as <basename>_count.npy", flush=True)
 
 
 if __name__ == "__main__":
