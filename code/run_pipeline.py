@@ -291,7 +291,7 @@ def main():
     n_regions = 1 + sum(c * c for c in crop_splits)
     lines = [
         f"# GPU k-means BoW + crop-region independent scoring + Mahalanobis (full-data logical AD)",
-        f"# DINOv2-with-registers-giant, anisotropic resize 672, mean layers [-18,-12]",
+        f"# DINOv2-with-registers-giant cached patch features, mean layers [-18,-12]",
         f"# k={args.k}, crop_split={args.crop_split} (total {n_regions} regions), agg={args.agg}, "
         f"seeds={args.seeds}, device={'%d GPU'%n_gpus if n_gpus else 'CPU'}, "
         f"cache_dir={args.cache_dir}, "
