@@ -204,11 +204,6 @@ def resolve_prompts(obj, cli_prompts, use_generated):
         print(f"[{obj}] 使用命令行显式指定的 prompt(直接前景): {cli_prompts}", flush=True)
         return cli_prompts, "foreground"
 
-    if obj in VALIDATED_PROMPTS:
-        prompts = VALIDATED_PROMPTS[obj]
-        print(f"[{obj}] 使用人工已验证的 prompt(直接前景): {prompts}", flush=True)
-        return prompts, "foreground"
-
     if use_generated:
         if not os.path.exists(GENERATED_PROMPTS_PATH):
             raise SystemExit(
@@ -227,6 +222,11 @@ def resolve_prompts(obj, cli_prompts, use_generated):
               f"sam3_segment_check.py 肉眼确认背景真的被分割干净、没有连带框住前景内容物,"
               f"再信任这批缓存结果。", flush=True)
         return prompts, mode
+
+    if obj in VALIDATED_PROMPTS:
+        prompts = VALIDATED_PROMPTS[obj]
+        print(f"[{obj}] 使用人工已验证的 prompt(直接前景): {prompts}", flush=True)
+        return prompts, "foreground"
 
     raise SystemExit(
         f"[{obj}] 没有已验证的提示词。可以: (1) 用 --prompts 显式指定并手动验证过;"
