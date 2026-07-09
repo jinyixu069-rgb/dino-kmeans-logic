@@ -1,324 +1,253 @@
-# run_pipeline_gpu.py
-# GPU 版 k-means 词袋 + crop 独立打分聚合 + Mahalanobis (full-data logical AD)
+# dual_branch_bow_pipeline.py
+# 真正的双分支设计,替代 mask_weighted_bow_pipeline.py 里"同一词袋加权"的思路。
 #
-# 相对 K-sweep 版的改动:
-#   - 新增 --crop-split N:把每张图的 48x48 patch 网格切成 (全图) + N×N 个 crop 子区域。
-#     每个"区域"(含全图)独立做 k-means 词袋 + LedoitWolf + Mahalanobis 打分,
-#     最后跨区域聚合成一个图级分数。这是 SINBAD "crop 当独立图" 思想的迁移。
-#     --crop-split 0 或 1 时退化为纯全图(= 你验证过的 0.83 锚点)。
-#   - 关键设计: 每个区域独立拟合自己的协方差(维度仍是 K,不拼成高维向量),
-#     从而绕开金字塔"拼高维向量导致协方差欠定"的坑。这是 SINBAD 的活法,不是金字塔的死法。
-#   - 聚合方式 --agg: mean / max / sum,跨区域聚合各自的马氏距离分数。
+# 读了 SALAD (ICCV 2025, arXiv 2509.02101) 之后发现:它用 mask 的方式不是"给一个统计量去噪",
+# 而是彻底的多分支架构 + 分数级融合(appearance / composition / global 三个分支各自独立打分,
+# 用各分支在验证集上的 z-score 标准化后直接相加)。这和你原本设想的"双分支"是一回事,
+# 和我上一版"同一词袋、只改计数权重"的思路不是一回事——这份脚本按你的原意重做。
 #
-# 重要局限: 本版在【已缓存的 patch 特征】上按空间切网格,不重新裁图过 DINO,
-#   因此只复现 SINBAD "局部化统计" 的作用,不复现 "小物体放大" 的作用。
+# 两个分支完全独立,不共享词表也不共享统计量:
+#   分支 A(不变,必须先复现锚点): 全图 patch 的 k-means 词袋 + LedoitWolf + Mahalanobis,
+#                                和你现有 baseline 完全一致。
+#   分支 B(新增,独立前景词袋): 只用 SAM3 前景 patch(权重 > 阈值)独立拟合一套 k-means 词表,
+#                                独立统计直方图(仍用软权重计数,兼顾"贴边"的前景 patch),
+#                                独立拟合 LedoitWolf + Mahalanobis。
+#   融合: 用 train_good 各分支自己的 Mahalanobis 分数算 mean/std 做 z-score 标准化,
+#         两分支标准化后相加,得到融合分数。只用 train 统计量做标准化,不碰测试标签,
+#         对应 SALAD 论文 Eq.5 的融合方式(他们用验证集统计量,这里用 train_good 自身,
+#         和你现有 pipeline 里 LedoitWolf 只在 train_good 上拟合的惯例一致)。
 #
-# 用法:
-#   python run_pipeline_gpu.py --all --seeds 0 1 --crop-split 0            # 全图锚点(=0.83)
-#   python run_pipeline_gpu.py --all --seeds 0 1 --crop-split 2 3          # 全图 + 2x2 + 3x3
-#   python run_pipeline_gpu.py --all --seeds 0 1 --crop-split 3 --agg max  # 换聚合方式
+# 输出 A / B / Fused 三个 AUROC,而不是只看融合结果:
+#   - A 必须先对上你已知的 pushpins 单类锚点(约 0.70-0.73),对不上说明代码有 bug。
+#   - B 单独多高,直接反映"前景词袋本身有没有信号"。
+#   - Fused 相对 max(A,B) 有没有提升,反映两个分支是否提供了互补信息
+#     (如果 Fused 提升不明显,说明 A、B 抓到的可能是同一种信号,双分支意义不大)。
+#
+# 用法(先跑 cache_sam3_foreground_masks.py 缓存前景权重,再跑这个):
+#   python run_pipeline.py --obj pushpins --seeds 0 1
 
 import os
 import argparse
 import numpy as np
 from datetime import datetime
-import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, as_completed
-
-import torch
+from sklearn.cluster import MiniBatchKMeans
 from sklearn.covariance import LedoitWolf
 from sklearn.metrics import roc_auc_score
 
 PROJECT_ROOT = "/mnt/nfs/xujy/logicdataset/dino_kmeans_logic"
 CACHE_DIR = os.path.join(PROJECT_ROOT, "features_cache")
-RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
-OBJS = ["breakfast_box", "juice_bottle", "pushpins", "screw_bag", "splicing_connectors"]
+MASK_CACHE_DIR = os.path.join(PROJECT_ROOT, "features_cache_fgmask")
+RESULTS_DIR = os.path.join(PROJECT_ROOT, "results", "dual_branch_bow")
 
 DEFAULT_K = 64
 KMEANS_FIT_SUBSAMPLE = 200_000
-KMEANS_ITERS = 100
-KMEANS_BATCH = 4096
-ASSIGN_CHUNK = 200_000
-GRID = 48   # 672 / 14 = 48,依赖特征提取时保留的行优先 patch 排列
+FG_FIT_THRESHOLD = 0.5   # 分支 B:只用前景权重 > 此阈值的 patch 拟合词表(词表纯度)
 
 
 # ----------------------------- 数据加载 -----------------------------
 
-def load_split_features(obj, split_name, cache_dir):
-    d = os.path.join(cache_dir, obj, split_name)
-    files = sorted(f for f in os.listdir(d) if f.endswith(".npy"))
-    return [np.load(os.path.join(d, f)).astype(np.float32) for f in files]
+def load_split(obj, split_name, cache_dir, mask_cache_dir):
+    feat_dir = os.path.join(cache_dir, obj, split_name)
+    mask_dir = os.path.join(mask_cache_dir, obj, split_name)
+    files = sorted(f for f in os.listdir(feat_dir) if f.endswith(".npy"))
+
+    feats, weights = [], []
+    missing_mask = 0
+    for f in files:
+        basename = f.rsplit(".", 1)[0]
+        feat = np.load(os.path.join(feat_dir, f)).astype(np.float32)
+        mask_path = os.path.join(mask_dir, basename + ".npy")
+        if os.path.exists(mask_path):
+            w = np.load(mask_path).astype(np.float32)
+        else:
+            w = np.ones(feat.shape[0], dtype=np.float32)
+            missing_mask += 1
+        feats.append(feat)
+        weights.append(w)
+
+    if missing_mask:
+        print(f"  [WARN] {obj}/{split_name}: {missing_mask}/{len(files)} 张图缺少缓存 mask,"
+              f"已退化为全前景权重。分支 B 的独立性会被这些图拉低,先补跑 "
+              f"cache_sam3_foreground_masks.py", flush=True)
+    return feats, weights
 
 
-# ----------------------------- crop 区域定义 -----------------------------
+# ----------------------------- k-means 拟合 -----------------------------
 
-def build_regions(crop_splits, n_patches):
-    """返回一个 region 列表,每个 region 是一个函数 patch_idx->bool_mask,
-    或直接返回每个 region 的 patch 索引(基于 48x48 行优先网格)。
-    region 0 永远是全图;之后是各个 N×N 切分的 crop。
-    crop_splits: 如 [2,3] 表示额外加 2x2 和 3x3 的 crop。"""
-    regions = [("full", None)]  # 全图; None 表示保留所有 patch,支持 48x48/64x64 等不同分辨率
-    if not crop_splits:
-        return regions
-
-    grid = int(round(np.sqrt(n_patches)))
-    if grid * grid != n_patches:
-        raise ValueError(f"n_patches={n_patches} is not a square grid")
-    grid_idx = np.arange(n_patches).reshape(grid, grid)
-
-    for n_split in crop_splits:
-        if n_split <= 1:
-            continue  # 1 等于全图,跳过避免重复
-        step = grid // n_split
-        for i in range(n_split):
-            for j in range(n_split):
-                r0 = i * step
-                r1 = (i + 1) * step if i < n_split - 1 else grid
-                c0 = j * step
-                c1 = (j + 1) * step if j < n_split - 1 else grid
-                idx = grid_idx[r0:r1, c0:c1].reshape(-1)
-                regions.append((f"{n_split}x{n_split}_{i}_{j}", idx))
-    return regions
-
-
-def extract_region_feats(feats_list, region_idx):
-    """从每张图的完整 patch 特征里,取出属于该 region 的 patch。
-    feats_list: list of [2304, D] numpy。返回 list of [len(region_idx), D]。"""
-    if region_idx is None:
-        return feats_list
-    return [f[region_idx] for f in feats_list]
-
-
-# ----------------------------- GPU k-means -----------------------------
-
-def kmeans_gpu(X, k, seed, device, n_iters=KMEANS_ITERS, batch_size=KMEANS_BATCH,
-              subsample=KMEANS_FIT_SUBSAMPLE):
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    n = X.shape[0]
+def fit_kmeans(pooled, k, seed, subsample=KMEANS_FIT_SUBSAMPLE):
+    n = pooled.shape[0]
     if n > subsample:
-        idx = torch.randperm(n, generator=g)[:subsample]
-        pool = X[idx]
-    else:
-        pool = X
-    n_pool = pool.shape[0]
-
-    init_idx = torch.randperm(n_pool, generator=g)[:k]
-    centroids = pool[init_idx].clone()
-    counts = torch.zeros(k, device=X.device)
-
-    for _ in range(n_iters):
-        bidx = torch.randint(0, n_pool, (min(batch_size, n_pool),), generator=g)
-        batch = pool[bidx]
-        assign = torch.cdist(batch, centroids).argmin(1)
-        sums = torch.zeros_like(centroids)
-        sums.index_add_(0, assign, batch)
-        cnts = torch.bincount(assign, minlength=k).to(centroids.dtype)
-        counts += cnts
-        mask = cnts > 0
-        if mask.any():
-            lr = (cnts[mask] / counts[mask]).unsqueeze(1)
-            centroids[mask] = (1 - lr) * centroids[mask] + lr * (sums[mask] / cnts[mask].unsqueeze(1))
-    return centroids
+        idx = np.random.RandomState(seed).choice(n, subsample, replace=False)
+        pooled = pooled[idx]
+    km = MiniBatchKMeans(n_clusters=k, random_state=seed, batch_size=4096, n_init="auto")
+    km.fit(pooled)
+    return km
 
 
-def assign_gpu(X, centroids, chunk=ASSIGN_CHUNK):
-    n = X.shape[0]
-    labels = torch.empty(n, dtype=torch.long, device=X.device)
-    for s in range(0, n, chunk):
-        e = min(s + chunk, n)
-        labels[s:e] = torch.cdist(X[s:e], centroids).argmin(1)
-    return labels
+def fit_branch_A(train_feats, k, seed):
+    """全图词表,不看 mask。必须先复现已知锚点。"""
+    pooled = np.concatenate(train_feats, axis=0)
+    return fit_kmeans(pooled, k, seed)
 
 
-def build_histogram_gpu(region_feats_list, centroids, k, device):
-    counts_per_img = [f.shape[0] for f in region_feats_list]
-    big = torch.cat([torch.from_numpy(f).to(device) for f in region_feats_list], dim=0)
-    labels = assign_gpu(big, centroids)
-    hists = torch.zeros((len(region_feats_list), k), dtype=torch.float64, device=device)
-    off = 0
-    for i, n in enumerate(counts_per_img):
-        hists[i] = torch.bincount(labels[off:off + n], minlength=k).to(torch.float64)
-        off += n
-    return hists.cpu().numpy()
+def fit_branch_B(train_feats, train_weights, k, seed, threshold):
+    """只用前景 patch 独立拟合词表。"""
+    fg_chunks = []
+    for feat, w in zip(train_feats, train_weights):
+        keep = w > threshold
+        if keep.any():
+            fg_chunks.append(feat[keep])
+    if not fg_chunks:
+        raise RuntimeError(
+            "所有 train_good 图在当前阈值下都没有前景 patch,"
+            "检查 mask 缓存是否正常,或调低 FG_FIT_THRESHOLD")
+    pooled = np.concatenate(fg_chunks, axis=0)
+    n_total = sum(f.shape[0] for f in train_feats)
+    print(f"    分支B独立拟合: 前景 patch {pooled.shape[0]}/{n_total} "
+          f"({pooled.shape[0]/n_total*100:.1f}%) 参与词表拟合", flush=True)
+    return fit_kmeans(pooled, k, seed)
 
 
-# ----------------------------- 单个 region 的打分 -----------------------------
+# ----------------------------- 直方图统计 -----------------------------
 
-def score_one_region(train_rf, good_rf, logical_rf, k, seed, device):
-    """对单个 region: 独立 k-means + 独立 LedoitWolf + Mahalanobis。
-    返回 (good_scores, logical_scores),都是原始马氏距离(未归一化)。"""
-    train_tensor = torch.from_numpy(np.concatenate(train_rf, axis=0)).to(device)
-    centroids = kmeans_gpu(train_tensor, k, seed, device)
+def build_hard_histogram(km, feats, k):
+    hists = np.zeros((len(feats), k), dtype=np.float64)
+    for i, feat in enumerate(feats):
+        labels = km.predict(feat)
+        hists[i] = np.bincount(labels, minlength=k)
+    return hists
 
-    train_hist = build_histogram_gpu(train_rf, centroids, k, device)
-    good_hist = build_histogram_gpu(good_rf, centroids, k, device)
-    logical_hist = build_histogram_gpu(logical_rf, centroids, k, device)
 
+def build_weighted_histogram(km, feats, weights, k):
+    """用前景软权重加权计数,即使不在阈值内的 patch 也按权重部分计入
+    (阈值只用来决定谁能参与拟合词表,不用来决定谁能计入直方图,避免二次硬截断放大噪声)。"""
+    hists = np.zeros((len(feats), k), dtype=np.float64)
+    for i, (feat, w) in enumerate(zip(feats, weights)):
+        labels = km.predict(feat)
+        hists[i] = np.bincount(labels, weights=w, minlength=k)
+    return hists
+
+
+# ----------------------------- LedoitWolf + Mahalanobis(带 train 自身分数,便于做标准化) -----------------------------
+
+def fit_ledoitwolf_and_score(train_hist, good_hist, logical_hist):
     lw = LedoitWolf().fit(train_hist)
-    mean_vec = torch.from_numpy(lw.location_).to(device=device, dtype=torch.float64)
-    precision = torch.from_numpy(lw.get_precision()).to(device=device, dtype=torch.float64)
+    mean_vec = lw.location_
+    precision = lw.get_precision()
 
-    def maha(hist_np):
-        h = torch.from_numpy(hist_np).to(device=device, dtype=torch.float64)
-        diff = h - mean_vec
-        return torch.einsum("ij,jk,ik->i", diff, precision, diff).cpu().numpy()
+    def maha(hist):
+        diff = hist - mean_vec
+        return np.einsum("ij,jk,ik->i", diff, precision, diff)
 
-    return maha(good_hist), maha(logical_hist)
-
-
-def zscore_normalize(good_s, logical_s, train_ref=None):
-    """跨 region 聚合前,把不同 region 的分数标准化到可比尺度。
-    用 good(正常测试)分数的均值/标准差做标准化 —— 但注意这里用了测试集正常样本的统计,
-    严格说应该用训练集重算一份正常分数来标准化。为简洁先用 good 的分布近似,
-    这只影响不同 region 的相对权重,不直接读测试标签(good/logical 都用同一套变换)。"""
-    mu = good_s.mean()
-    sd = good_s.std() + 1e-8
-    return (good_s - mu) / sd, (logical_s - mu) / sd
+    train_s = maha(train_hist)     # 用于后续 z-score 标准化的参考分布
+    good_s = maha(good_hist)
+    logical_s = maha(logical_hist)
+    return train_s, good_s, logical_s
 
 
-# ----------------------------- 单类别流程 -----------------------------
-
-def run_one_category(obj, k, seed, crop_splits, agg, device_str, cache_dir):
-    device = torch.device(device_str)
-    train_feats = load_split_features(obj, "train_good", cache_dir)
-    good_feats = load_split_features(obj, "test_good", cache_dir)
-    logical_feats = load_split_features(obj, "test_logical", cache_dir)
-
-    regions = build_regions(crop_splits, train_feats[0].shape[0])
-
-    good_region_scores = []
-    logical_region_scores = []
-    for _, region_idx in regions:
-        train_rf = extract_region_feats(train_feats, region_idx)
-        good_rf = extract_region_feats(good_feats, region_idx)
-        logical_rf = extract_region_feats(logical_feats, region_idx)
-
-        good_s, logical_s = score_one_region(train_rf, good_rf, logical_rf, k, seed, device)
-        # 标准化后再聚合,避免某个 region 因尺度大主导聚合结果
-        good_z, logical_z = zscore_normalize(good_s, logical_s)
-        good_region_scores.append(good_z)
-        logical_region_scores.append(logical_z)
-
-    good_mat = np.stack(good_region_scores, axis=0)      # [n_regions, n_good]
-    logical_mat = np.stack(logical_region_scores, axis=0)  # [n_regions, n_logical]
-
-    if agg == "mean":
-        good_final = good_mat.mean(0)
-        logical_final = logical_mat.mean(0)
-    elif agg == "max":
-        good_final = good_mat.max(0)
-        logical_final = logical_mat.max(0)
-    elif agg == "sum":
-        good_final = good_mat.sum(0)
-        logical_final = logical_mat.sum(0)
-    else:
-        raise ValueError(agg)
-
-    y_true = np.concatenate([np.zeros(len(good_final)), np.ones(len(logical_final))])
-    y_score = np.concatenate([good_final, logical_final])
+def auroc(good_s, logical_s):
+    y_true = np.concatenate([np.zeros(len(good_s)), np.ones(len(logical_s))])
+    y_score = np.concatenate([good_s, logical_s])
     return roc_auc_score(y_true, y_score)
 
 
-# ----------------------------- 并行调度 -----------------------------
-
-def _worker(task):
-    obj, k, seed, crop_splits, agg, gpu_id, cache_dir = task
-    if gpu_id >= 0:
-        torch.cuda.set_device(gpu_id)
-        device_str = f"cuda:{gpu_id}"
-    else:
-        device_str = "cpu"
-    auc = run_one_category(obj, k, seed, crop_splits, agg, device_str, cache_dir)
-    return obj, seed, auc
+def zscore(train_s, good_s, logical_s):
+    mu, sd = train_s.mean(), train_s.std() + 1e-8
+    return (good_s - mu) / sd, (logical_s - mu) / sd
 
 
-def run_all_jobs(objs, k, seeds, crop_splits, agg, device_pref, workers, cache_dir):
-    jobs = [(obj, seed) for seed in seeds for obj in objs]
-    results = {obj: {} for obj in objs}
-    n_gpus = 0 if device_pref == "cpu" else (torch.cuda.device_count() if torch.cuda.is_available() else 0)
+# ----------------------------- 单个 seed 的完整流程 -----------------------------
 
-    if n_gpus >= 1:
-        tagged = [(obj, k, seed, crop_splits, agg, i % n_gpus, cache_dir)
-                  for i, (obj, seed) in enumerate(jobs)]
-        max_workers = workers or n_gpus
-        ctx = mp.get_context("spawn")
-        with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
-            futs = [ex.submit(_worker, t) for t in tagged]
-            for fut in as_completed(futs):
-                obj, seed, auc = fut.result()
-                results[obj][seed] = auc
-                print(f"[seed={seed}] {obj:22s}: {auc:.4f}", flush=True)
-    else:
-        for (obj, seed) in jobs:
-            _, _, auc = _worker((obj, k, seed, crop_splits, agg, -1, cache_dir))
-            results[obj][seed] = auc
-            print(f"[seed={seed}] {obj:22s}: {auc:.4f}", flush=True)
+def run_one_seed(obj, k, seed, threshold, cache_dir, mask_cache_dir):
+    train_feats, train_w = load_split(obj, "train_good", cache_dir, mask_cache_dir)
+    good_feats, good_w = load_split(obj, "test_good", cache_dir, mask_cache_dir)
+    logical_feats, logical_w = load_split(obj, "test_logical", cache_dir, mask_cache_dir)
 
-    ordered = {obj: [results[obj][s] for s in seeds] for obj in objs}
-    return ordered
+    # ---- 分支 A:全图词袋(和现有 baseline 一致) ----
+    km_a = fit_branch_A(train_feats, k, seed)
+    train_hist_a = build_hard_histogram(km_a, train_feats, k)
+    good_hist_a = build_hard_histogram(km_a, good_feats, k)
+    logical_hist_a = build_hard_histogram(km_a, logical_feats, k)
+    train_sa, good_sa, logical_sa = fit_ledoitwolf_and_score(
+        train_hist_a, good_hist_a, logical_hist_a)
+    auc_a = auroc(good_sa, logical_sa)
+
+    # ---- 分支 B:独立前景词袋 ----
+    km_b = fit_branch_B(train_feats, train_w, k, seed, threshold)
+    train_hist_b = build_weighted_histogram(km_b, train_feats, train_w, k)
+    good_hist_b = build_weighted_histogram(km_b, good_feats, good_w, k)
+    logical_hist_b = build_weighted_histogram(km_b, logical_feats, logical_w, k)
+    train_sb, good_sb, logical_sb = fit_ledoitwolf_and_score(
+        train_hist_b, good_hist_b, logical_hist_b)
+    auc_b = auroc(good_sb, logical_sb)
+
+    # ---- 融合:各分支用 train_good 自己的分数做 z-score,再相加 ----
+    good_za, logical_za = zscore(train_sa, good_sa, logical_sa)
+    good_zb, logical_zb = zscore(train_sb, good_sb, logical_sb)
+    good_fused = good_za + good_zb
+    logical_fused = logical_za + logical_zb
+    auc_fused = auroc(good_fused, logical_fused)
+
+    return auc_a, auc_b, auc_fused
 
 
 # ----------------------------- 主入口 -----------------------------
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--obj", nargs="+", choices=OBJS)
-    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--obj", default="pushpins",
+                    choices=["breakfast_box", "juice_bottle", "pushpins",
+                             "screw_bag", "splicing_connectors"])
     ap.add_argument("--k", type=int, default=DEFAULT_K)
-    ap.add_argument("--seeds", type=int, nargs="+", default=[0])
-    ap.add_argument("--crop-split", type=int, nargs="+", default=[0],
-                    help="额外的 crop 切分粒度,如 2 3 表示全图+2x2+3x3。0/1=仅全图(锚点)")
-    ap.add_argument("--agg", choices=["mean", "max", "sum"], default="mean",
-                    help="跨 region 聚合方式")
+    ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1])
+    ap.add_argument("--fg-threshold", type=float, default=FG_FIT_THRESHOLD)
     ap.add_argument("--cache-dir", default=CACHE_DIR)
-    ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
-    ap.add_argument("--workers", type=int, default=0)
+    ap.add_argument("--mask-cache-dir", default=MASK_CACHE_DIR)
     args = ap.parse_args()
 
-    objs = OBJS if args.all else args.obj
-    if objs is None:
-        print("请指定 --obj <category> 或 --all")
-        return
-    if args.device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("--device cuda 但无可用 GPU")
-
-    crop_splits = [c for c in args.crop_split if c > 1]  # 过滤掉 0/1,全图总是包含
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    results = run_all_jobs(objs, args.k, args.seeds, crop_splits, args.agg,
-                           args.device, args.workers, args.cache_dir)
 
-    n_gpus = 0 if args.device == "cpu" else (torch.cuda.device_count() if torch.cuda.is_available() else 0)
-    n_regions = 1 + sum(c * c for c in crop_splits)
+    results = {"A": [], "B": [], "Fused": []}
+    for seed in args.seeds:
+        print(f"\n=== {args.obj} seed={seed} ===", flush=True)
+        auc_a, auc_b, auc_fused = run_one_seed(
+            args.obj, args.k, seed, args.fg_threshold, args.cache_dir, args.mask_cache_dir)
+        print(f"  A (全图词袋, 现有 baseline)     : {auc_a:.4f}", flush=True)
+        print(f"  B (独立前景词袋)                : {auc_b:.4f}", flush=True)
+        print(f"  Fused (A、B z-score 相加)       : {auc_fused:.4f}", flush=True)
+        results["A"].append(auc_a)
+        results["B"].append(auc_b)
+        results["Fused"].append(auc_fused)
+
     lines = [
-        f"# GPU k-means BoW + crop-region independent scoring + Mahalanobis (full-data logical AD)",
-        f"# DINOv2-with-registers-giant cached patch features, mean layers [-18,-12]",
-        f"# k={args.k}, crop_split={args.crop_split} (total {n_regions} regions), agg={args.agg}, "
-        f"seeds={args.seeds}, device={'%d GPU'%n_gpus if n_gpus else 'CPU'}, "
-        f"cache_dir={args.cache_dir}, "
+        f"# dual-branch BoW (global + independent foreground), obj={args.obj}, k={args.k}, "
+        f"fg_threshold={args.fg_threshold}, seeds={args.seeds}, "
         f"time={datetime.now().isoformat(timespec='seconds')}",
-        f"# NOTE: crop 在已缓存 patch 特征上切网格,不重裁图过 DINO(只复现局部化统计,不复现小物体放大)",
+        f"# 分支设计参考 SALAD (ICCV 2025, arXiv 2509.02101) 的多分支 + z-score 融合机制",
         "",
-        f"{'category':22s}  {'mean':>7s}  {'std':>6s}  per-seed",
+        "variant                    mean     std      per-seed",
     ]
-    macro_ps = np.zeros(len(args.seeds))
-    for obj in objs:
-        arr = np.array(results[obj])
-        lines.append(f"{obj:22s}  {arr.mean():.4f}  {arr.std():.4f}  "
+    for name, label in [("A", "A (全图词袋)"), ("B", "B (独立前景词袋)"),
+                        ("Fused", "Fused (A+B)")]:
+        arr = np.array(results[name])
+        lines.append(f"{label:24s}  {arr.mean():.4f}  {arr.std():.4f}  "
                      f"[{', '.join(f'{a:.4f}' for a in arr)}]")
-    if args.all:
-        for si in range(len(args.seeds)):
-            macro_ps[si] = np.mean([results[obj][si] for obj in objs])
-        lines.append(f"{'MACRO':22s}  {macro_ps.mean():.4f}  {macro_ps.std():.4f}  "
-                     f"[{', '.join(f'{m:.4f}' for m in macro_ps)}]")
+
+    lines.append("")
+    lines.append("解读提示:")
+    lines.append("  - A 必须先对上你已知的 pushpins 单类锚点(约0.70-0.73);对不上说明这份代码有 bug,")
+    lines.append("    B/Fused 的数字先不要采信。")
+    lines.append("  - B 单独的数字反映'前景词袋'本身有没有信号,和 A 无关。")
+    lines.append("  - Fused 若明显高于 max(A,B),说明两个分支抓到了互补信息,双分支值得留;")
+    lines.append("    若 Fused 接近 max(A,B),说明两分支冗余,加分支的复杂度不划算。")
 
     report = "\n".join(lines)
-    print("\n" + report)
+    print("\n" + report, flush=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    cs_tag = "".join(str(x) for x in args.crop_split)
-    out_path = os.path.join(RESULTS_DIR, f"kmeans_gpu_crop{cs_tag}_{args.agg}_k{args.k}_{stamp}.txt")
+    out_path = os.path.join(RESULTS_DIR, f"{args.obj}_k{args.k}_{stamp}.txt")
     with open(out_path, "w") as f:
         f.write(report + "\n")
-    print(f"\nSaved to {out_path}")
+    print(f"\nSaved to {out_path}", flush=True)
 
 
 if __name__ == "__main__":
