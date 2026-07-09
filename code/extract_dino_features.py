@@ -1,7 +1,7 @@
 # extract_dino_features.py
 # 用 DINOv2-with-registers-giant 提取 patch token 特征。
 # 关键点:
-#   - 各向异性 resize 到 672x672(不裁剪、不 pad),避免中心裁剪切掉 LOCO 非正方形图两端的内容
+#   - 各向异性 resize 到 IMAGE_SIZE x IMAGE_SIZE(不裁剪、不 pad),避免中心裁剪切掉 LOCO 非正方形图两端的内容
 #   - 去掉 CLS token 和 register token,只保留 patch token
 #   - 按 mean layers [-18,-12](闭区间)取平均
 #   - 存成 float16 .npy,每张图 [2304, 1536] ≈ 6.75MB
@@ -53,9 +53,9 @@ def list_images(d):
     return fs
 
 
-def preprocess_image(path):
+def preprocess_image(path, image_size):
     """各向异性 resize 到 IMAGE_SIZE x IMAGE_SIZE,再做 ImageNet 标准化。返回 [3,H,W] float tensor。"""
-    img = Image.open(path).convert("RGB").resize((IMAGE_SIZE, IMAGE_SIZE), Image.BICUBIC)
+    img = Image.open(path).convert("RGB").resize((image_size, image_size), Image.BICUBIC)
     arr = torch.from_numpy(np.array(img, copy=True)).float().permute(2, 0, 1) / 255.0
     arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
     return arr
@@ -69,8 +69,8 @@ def resolve_layer_indices(num_hidden_states, start_neg, end_neg):
 
 
 @torch.no_grad()
-def extract_batch(model, image_paths, num_register_tokens, layer_indices, device):
-    batch = torch.stack([preprocess_image(p) for p in image_paths], dim=0)
+def extract_batch(model, image_paths, num_register_tokens, layer_indices, device, image_size):
+    batch = torch.stack([preprocess_image(p, image_size) for p in image_paths], dim=0)
     pixel_values = batch.to(device=device, dtype=DTYPE)
 
     out = model(pixel_values=pixel_values, output_hidden_states=True)
@@ -83,7 +83,8 @@ def extract_batch(model, image_paths, num_register_tokens, layer_indices, device
 
 
 def process_split(model, obj, split_name, split_subdir,
-                  num_register_tokens, layer_indices, device, cache_dir, overwrite):
+                  num_register_tokens, layer_indices, device, cache_dir,
+                  overwrite, image_size, batch_size):
     src_dir = os.path.join(DATASET_ROOT, obj, split_subdir)
     out_dir = os.path.join(cache_dir, obj, split_name)
     os.makedirs(out_dir, exist_ok=True)
@@ -97,10 +98,10 @@ def process_split(model, obj, split_name, split_subdir,
             if overwrite or not os.path.exists(os.path.join(out_dir, f.rsplit(".", 1)[0] + ".npy"))]
     print(f"[{obj}/{split_name}] {len(files)} total, {len(todo)} to extract")
 
-    for i in range(0, len(todo), BATCH_SIZE):
-        batch_files = todo[i:i + BATCH_SIZE]
+    for i in range(0, len(todo), batch_size):
+        batch_files = todo[i:i + batch_size]
         batch_paths = [os.path.join(src_dir, f) for f in batch_files]
-        feats = extract_batch(model, batch_paths, num_register_tokens, layer_indices, device)
+        feats = extract_batch(model, batch_paths, num_register_tokens, layer_indices, device, image_size)
         for f, feat in zip(batch_files, feats):
             np.save(os.path.join(out_dir, f.rsplit(".", 1)[0] + ".npy"), feat)
         print(f"  [{obj}/{split_name}] {min(i+BATCH_SIZE, len(todo))}/{len(todo)}", flush=True)
@@ -113,6 +114,8 @@ def main():
                              "screw_bag", "splicing_connectors"])
     ap.add_argument("--model_path", default=DEFAULT_MODEL_PATH)
     ap.add_argument("--cache_dir", default=DEFAULT_CACHE_DIR)
+    ap.add_argument("--image-size", type=int, default=IMAGE_SIZE)
+    ap.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
@@ -127,11 +130,13 @@ def main():
     print(f"num_register_tokens={num_register_tokens}, "
           f"num_hidden_layers={model.config.num_hidden_layers}, "
           f"layer indices={layer_indices} (of {num_hidden_states})")
+    print(f"image_size={args.image_size}, batch_size={args.batch_size}, cache_dir={args.cache_dir}")
 
     for split_name, split_subdir in SPLITS.items():
         process_split(model, args.obj, split_name, split_subdir,
                       num_register_tokens, layer_indices, device,
-                      args.cache_dir, args.overwrite)
+                      args.cache_dir, args.overwrite,
+                      args.image_size, args.batch_size)
 
     print(f"Done. Features cached under {os.path.join(args.cache_dir, args.obj)}")
 

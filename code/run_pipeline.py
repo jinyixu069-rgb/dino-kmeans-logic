@@ -44,32 +44,38 @@ GRID = 48   # 672 / 14 = 48,依赖特征提取时保留的行优先 patch 排列
 
 # ----------------------------- 数据加载 -----------------------------
 
-def load_split_features(obj, split_name):
-    d = os.path.join(CACHE_DIR, obj, split_name)
+def load_split_features(obj, split_name, cache_dir):
+    d = os.path.join(cache_dir, obj, split_name)
     files = sorted(f for f in os.listdir(d) if f.endswith(".npy"))
     return [np.load(os.path.join(d, f)).astype(np.float32) for f in files]
 
 
 # ----------------------------- crop 区域定义 -----------------------------
 
-def build_regions(crop_splits):
+def build_regions(crop_splits, n_patches):
     """返回一个 region 列表,每个 region 是一个函数 patch_idx->bool_mask,
     或直接返回每个 region 的 patch 索引(基于 48x48 行优先网格)。
     region 0 永远是全图;之后是各个 N×N 切分的 crop。
     crop_splits: 如 [2,3] 表示额外加 2x2 和 3x3 的 crop。"""
-    grid_idx = np.arange(GRID * GRID).reshape(GRID, GRID)
-    regions = [("full", grid_idx.reshape(-1))]  # 全图
+    regions = [("full", None)]  # 全图; None 表示保留所有 patch,支持 48x48/64x64 等不同分辨率
+    if not crop_splits:
+        return regions
+
+    grid = int(round(np.sqrt(n_patches)))
+    if grid * grid != n_patches:
+        raise ValueError(f"n_patches={n_patches} is not a square grid")
+    grid_idx = np.arange(n_patches).reshape(grid, grid)
 
     for n_split in crop_splits:
         if n_split <= 1:
             continue  # 1 等于全图,跳过避免重复
-        step = GRID // n_split
+        step = grid // n_split
         for i in range(n_split):
             for j in range(n_split):
                 r0 = i * step
-                r1 = (i + 1) * step if i < n_split - 1 else GRID
+                r1 = (i + 1) * step if i < n_split - 1 else grid
                 c0 = j * step
-                c1 = (j + 1) * step if j < n_split - 1 else GRID
+                c1 = (j + 1) * step if j < n_split - 1 else grid
                 idx = grid_idx[r0:r1, c0:c1].reshape(-1)
                 regions.append((f"{n_split}x{n_split}_{i}_{j}", idx))
     return regions
@@ -78,6 +84,8 @@ def build_regions(crop_splits):
 def extract_region_feats(feats_list, region_idx):
     """从每张图的完整 patch 特征里,取出属于该 region 的 patch。
     feats_list: list of [2304, D] numpy。返回 list of [len(region_idx), D]。"""
+    if region_idx is None:
+        return feats_list
     return [f[region_idx] for f in feats_list]
 
 
@@ -170,13 +178,13 @@ def zscore_normalize(good_s, logical_s, train_ref=None):
 
 # ----------------------------- 单类别流程 -----------------------------
 
-def run_one_category(obj, k, seed, crop_splits, agg, device_str):
+def run_one_category(obj, k, seed, crop_splits, agg, device_str, cache_dir):
     device = torch.device(device_str)
-    train_feats = load_split_features(obj, "train_good")
-    good_feats = load_split_features(obj, "test_good")
-    logical_feats = load_split_features(obj, "test_logical")
+    train_feats = load_split_features(obj, "train_good", cache_dir)
+    good_feats = load_split_features(obj, "test_good", cache_dir)
+    logical_feats = load_split_features(obj, "test_logical", cache_dir)
 
-    regions = build_regions(crop_splits)
+    regions = build_regions(crop_splits, train_feats[0].shape[0])
 
     good_region_scores = []
     logical_region_scores = []
@@ -214,23 +222,23 @@ def run_one_category(obj, k, seed, crop_splits, agg, device_str):
 # ----------------------------- 并行调度 -----------------------------
 
 def _worker(task):
-    obj, k, seed, crop_splits, agg, gpu_id = task
+    obj, k, seed, crop_splits, agg, gpu_id, cache_dir = task
     if gpu_id >= 0:
         torch.cuda.set_device(gpu_id)
         device_str = f"cuda:{gpu_id}"
     else:
         device_str = "cpu"
-    auc = run_one_category(obj, k, seed, crop_splits, agg, device_str)
+    auc = run_one_category(obj, k, seed, crop_splits, agg, device_str, cache_dir)
     return obj, seed, auc
 
 
-def run_all_jobs(objs, k, seeds, crop_splits, agg, device_pref, workers):
+def run_all_jobs(objs, k, seeds, crop_splits, agg, device_pref, workers, cache_dir):
     jobs = [(obj, seed) for seed in seeds for obj in objs]
     results = {obj: {} for obj in objs}
     n_gpus = 0 if device_pref == "cpu" else (torch.cuda.device_count() if torch.cuda.is_available() else 0)
 
     if n_gpus >= 1:
-        tagged = [(obj, k, seed, crop_splits, agg, i % n_gpus)
+        tagged = [(obj, k, seed, crop_splits, agg, i % n_gpus, cache_dir)
                   for i, (obj, seed) in enumerate(jobs)]
         max_workers = workers or n_gpus
         ctx = mp.get_context("spawn")
@@ -242,7 +250,7 @@ def run_all_jobs(objs, k, seeds, crop_splits, agg, device_pref, workers):
                 print(f"[seed={seed}] {obj:22s}: {auc:.4f}", flush=True)
     else:
         for (obj, seed) in jobs:
-            _, _, auc = _worker((obj, k, seed, crop_splits, agg, -1))
+            _, _, auc = _worker((obj, k, seed, crop_splits, agg, -1, cache_dir))
             results[obj][seed] = auc
             print(f"[seed={seed}] {obj:22s}: {auc:.4f}", flush=True)
 
@@ -254,7 +262,7 @@ def run_all_jobs(objs, k, seeds, crop_splits, agg, device_pref, workers):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--obj", choices=OBJS)
+    ap.add_argument("--obj", nargs="+", choices=OBJS)
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--k", type=int, default=DEFAULT_K)
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
@@ -262,11 +270,12 @@ def main():
                     help="额外的 crop 切分粒度,如 2 3 表示全图+2x2+3x3。0/1=仅全图(锚点)")
     ap.add_argument("--agg", choices=["mean", "max", "sum"], default="mean",
                     help="跨 region 聚合方式")
+    ap.add_argument("--cache-dir", default=CACHE_DIR)
     ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     ap.add_argument("--workers", type=int, default=0)
     args = ap.parse_args()
 
-    objs = OBJS if args.all else ([args.obj] if args.obj else None)
+    objs = OBJS if args.all else args.obj
     if objs is None:
         print("请指定 --obj <category> 或 --all")
         return
@@ -275,7 +284,8 @@ def main():
 
     crop_splits = [c for c in args.crop_split if c > 1]  # 过滤掉 0/1,全图总是包含
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    results = run_all_jobs(objs, args.k, args.seeds, crop_splits, args.agg, args.device, args.workers)
+    results = run_all_jobs(objs, args.k, args.seeds, crop_splits, args.agg,
+                           args.device, args.workers, args.cache_dir)
 
     n_gpus = 0 if args.device == "cpu" else (torch.cuda.device_count() if torch.cuda.is_available() else 0)
     n_regions = 1 + sum(c * c for c in crop_splits)
@@ -284,6 +294,7 @@ def main():
         f"# DINOv2-with-registers-giant, anisotropic resize 672, mean layers [-18,-12]",
         f"# k={args.k}, crop_split={args.crop_split} (total {n_regions} regions), agg={args.agg}, "
         f"seeds={args.seeds}, device={'%d GPU'%n_gpus if n_gpus else 'CPU'}, "
+        f"cache_dir={args.cache_dir}, "
         f"time={datetime.now().isoformat(timespec='seconds')}",
         f"# NOTE: crop 在已缓存 patch 特征上切网格,不重裁图过 DINO(只复现局部化统计,不复现小物体放大)",
         "",
