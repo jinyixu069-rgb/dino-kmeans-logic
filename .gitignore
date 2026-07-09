@@ -1,5 +1,7 @@
 features_cache/
 features_cache_*/
+models/
+third_party/
 results/
 __pycache__/
 *.pyc

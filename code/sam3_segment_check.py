@@ -1,0 +1,176 @@
+# sam3_segment_check.py
+# 用 SAM 3 文本概念提示验证 pushpins 图钉实例分割质量。
+# 只做肉眼诊断,不接入现有 anomaly pipeline。
+#
+# 权重建议从 ModelScope 下载到本地,然后用 --checkpoint 指向 sam3.pt:
+#   modelscope download --model facebook/sam3 --local_dir /path/to/sam3_model
+#   python sam3_segment_check.py --checkpoint /path/to/sam3_model/sam3.pt
+#
+# SAM 3 源码来自:
+#   https://github.com/facebookresearch/sam3
+
+import os
+import sys
+import argparse
+from contextlib import nullcontext
+from pathlib import Path
+
+import numpy as np
+import torch
+from PIL import Image
+import matplotlib.pyplot as plt
+
+DATASET_ROOT = "/mnt/nfs/xujy/logicdataset/datasets/mvtec_loco_anomaly_detection"
+PROJECT_ROOT = "/mnt/nfs/xujy/logicdataset/dino_kmeans_logic"
+DEFAULT_SAM3_ROOT = os.path.join(PROJECT_ROOT, "third_party", "sam3")
+DEFAULT_OUT_DIR = os.path.join(PROJECT_ROOT, "results", "sam3_check")
+
+SAMPLE_IMAGES = [
+    ("pushpins", "train/good", "000.png"),
+    ("pushpins", "test/logical_anomalies", "000.png"),
+]
+
+
+def resolve_checkpoint(path):
+    if path is None:
+        path = os.environ.get("SAM3_CHECKPOINT")
+    if path is None:
+        raise ValueError(
+            "请通过 --checkpoint 或环境变量 SAM3_CHECKPOINT 指定 ModelScope 下载的 sam3.pt"
+        )
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    return path
+
+
+def import_sam3(sam3_root):
+    sam3_root = os.path.abspath(sam3_root)
+    if not os.path.isdir(sam3_root):
+        raise FileNotFoundError(f"SAM3 repo not found: {sam3_root}")
+    sys.path.insert(0, sam3_root)
+
+    from sam3 import build_sam3_image_model
+    from sam3.model.sam3_image_processor import Sam3Processor
+
+    bpe_path = os.path.join(sam3_root, "sam3", "assets", "bpe_simple_vocab_16e6.txt.gz")
+    return build_sam3_image_model, Sam3Processor, bpe_path
+
+
+def overlay_masks(image, masks, scores):
+    overlay = np.array(image).astype(np.float32)
+    rng = np.random.RandomState(0)
+    masks_np = masks.detach().cpu().numpy()
+    if masks_np.ndim == 4:
+        masks_np = masks_np[:, 0]
+
+    for i, mask in enumerate(masks_np):
+        color = rng.randint(0, 255, 3).astype(np.float32)
+        m = mask.astype(bool)
+        overlay[m] = overlay[m] * 0.4 + color * 0.6
+    return overlay.astype(np.uint8)
+
+
+def draw_boxes(ax, boxes, scores):
+    if boxes is None:
+        return
+    boxes_np = boxes.detach().float().cpu().numpy()
+    scores_np = scores.detach().float().cpu().numpy() if scores is not None else [None] * len(boxes_np)
+    for box, score in zip(boxes_np, scores_np):
+        x0, y0, x1, y1 = box.tolist()
+        rect = plt.Rectangle(
+            (x0, y0), x1 - x0, y1 - y0,
+            linewidth=1.5, edgecolor="lime", facecolor="none"
+        )
+        ax.add_patch(rect)
+        if score is not None:
+            ax.text(x0, max(0, y0 - 4), f"{float(score):.2f}",
+                    color="lime", fontsize=8,
+                    bbox={"facecolor": "black", "alpha": 0.5, "pad": 1})
+
+
+def inference_context(device):
+    if device == "cuda":
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
+
+def run_one(processor, image_path, prompt, out_path, device):
+    image = Image.open(image_path).convert("RGB")
+    with inference_context(device):
+        state = processor.set_image(image)
+        processor.reset_all_prompts(state)
+        state = processor.set_text_prompt(prompt=prompt, state=state)
+
+    masks = state.get("masks")
+    boxes = state.get("boxes")
+    scores = state.get("scores")
+    n_instances = 0 if masks is None else int(masks.shape[0])
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    axes[0].imshow(image)
+    axes[0].set_title(os.path.basename(image_path))
+    axes[0].axis("off")
+
+    if masks is not None and n_instances > 0:
+        overlay = overlay_masks(image, masks, scores)
+    else:
+        overlay = np.array(image)
+    axes[1].imshow(overlay)
+    draw_boxes(axes[1], boxes, scores)
+    axes[1].set_title(f"{n_instances} instances for '{prompt}'")
+    axes[1].axis("off")
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return n_instances
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--checkpoint", default=None,
+                    help="ModelScope 下载目录中的 sam3.pt 路径; 也可用 SAM3_CHECKPOINT 环境变量")
+    ap.add_argument("--sam3-root", default=DEFAULT_SAM3_ROOT)
+    ap.add_argument("--out-dir", default=DEFAULT_OUT_DIR)
+    ap.add_argument("--prompt", default="pushpin")
+    ap.add_argument("--confidence", type=float, default=0.5)
+    ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    args = ap.parse_args()
+
+    checkpoint = resolve_checkpoint(args.checkpoint)
+    device = "cuda" if args.device != "cpu" and torch.cuda.is_available() else "cpu"
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    build_sam3_image_model, Sam3Processor, bpe_path = import_sam3(args.sam3_root)
+    print(f"Loading SAM3 from {checkpoint} on {device} ...", flush=True)
+    model = build_sam3_image_model(
+        bpe_path=bpe_path,
+        checkpoint_path=checkpoint,
+        load_from_HF=False,
+        device=device,
+    )
+    processor = Sam3Processor(
+        model,
+        device=device,
+        confidence_threshold=args.confidence,
+    )
+
+    for obj, split, fname in SAMPLE_IMAGES:
+        img_path = os.path.join(DATASET_ROOT, obj, split, fname)
+        if not os.path.exists(img_path):
+            print(f"[skip] not found: {img_path}", flush=True)
+            continue
+        out_name = f"{obj}_{split.replace('/', '_')}_{fname}"
+        out_path = os.path.join(args.out_dir, out_name)
+        n_instances = run_one(processor, img_path, args.prompt, out_path, device)
+        print(
+            f"{obj}/{split}/{fname}: detected {n_instances} instances "
+            f"for prompt '{args.prompt}'",
+            flush=True,
+        )
+        print(f"  saved: {out_path}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
