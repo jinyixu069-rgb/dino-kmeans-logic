@@ -156,6 +156,17 @@ def zscore(train_s, good_s, logical_s):
     return (good_s - mu) / sd, (logical_s - mu) / sd
 
 
+def branch_correlation(good_za, logical_za, good_zb, logical_zb):
+    """诊断用:A、B 两个分支的 z-score 在全部测试图(good+logical)上的相关系数。
+    不参与任何打分或权重决策,不涉及测试标签的"设计选择",单纯解释
+    "为什么融合没有比单分支好"这个机制性问题——相关性高说明 B 只是"去噪版的 A",
+    两者没有互补信息;相关性低说明 A 里其实有 B 抓不到的独立信号,只是加法这种
+    融合方式没用好。"""
+    za = np.concatenate([good_za, logical_za])
+    zb = np.concatenate([good_zb, logical_zb])
+    return float(np.corrcoef(za, zb)[0, 1])
+
+
 # ----------------------------- 单个 seed 的完整流程 -----------------------------
 
 def run_one_seed(obj, k, seed, threshold, cache_dir, mask_cache_dir):
@@ -181,14 +192,27 @@ def run_one_seed(obj, k, seed, threshold, cache_dir, mask_cache_dir):
         train_hist_b, good_hist_b, logical_hist_b)
     auc_b = auroc(good_sb, logical_sb)
 
-    # ---- 融合:各分支用 train_good 自己的分数做 z-score,再相加 ----
+    # ---- 融合:各分支用 train_good 自己的分数做 z-score ----
     good_za, logical_za = zscore(train_sa, good_sa, logical_sa)
     good_zb, logical_zb = zscore(train_sb, good_sb, logical_sb)
-    good_fused = good_za + good_zb
-    logical_fused = logical_za + logical_zb
-    auc_fused = auroc(good_fused, logical_fused)
 
-    return auc_a, auc_b, auc_fused
+    # 融合方式一:相加(SALAD 用的方式)
+    good_sum = good_za + good_zb
+    logical_sum = logical_za + logical_zb
+    auc_sum = auroc(good_sum, logical_sum)
+
+    # 融合方式二:取较大值。对"一个分支弱/带噪声"这种情况通常比相加更稳健——
+    # 噪声分支只有在它比另一个分支更"确信异常"时才会被采纳,不会把强分支的
+    # 高分拉低。用和 crop 聚合代码里 --agg max 同一个思路,零额外算力
+    # (复用同一批已经算好的 z-score,不用重新拟合)。
+    good_max = np.maximum(good_za, good_zb)
+    logical_max = np.maximum(logical_za, logical_zb)
+    auc_max = auroc(good_max, logical_max)
+
+    # 诊断:A、B 两分支的分数相关性,解释融合为什么有效/无效,不参与打分决策
+    corr = branch_correlation(good_za, logical_za, good_zb, logical_zb)
+
+    return auc_a, auc_b, auc_sum, auc_max, corr
 
 
 # ----------------------------- 主入口 -----------------------------
@@ -207,17 +231,22 @@ def main():
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    results = {"A": [], "B": [], "Fused": []}
+    results = {"A": [], "B": [], "Fused": [], "FusedMax": [], "corr": []}
     for seed in args.seeds:
         print(f"\n=== {args.obj} seed={seed} ===", flush=True)
-        auc_a, auc_b, auc_fused = run_one_seed(
+        auc_a, auc_b, auc_sum, auc_max, corr = run_one_seed(
             args.obj, args.k, seed, args.fg_threshold, args.cache_dir, args.mask_cache_dir)
         print(f"  A (全图词袋, 现有 baseline)     : {auc_a:.4f}", flush=True)
         print(f"  B (独立前景词袋)                : {auc_b:.4f}", flush=True)
-        print(f"  Fused (A、B z-score 相加)       : {auc_fused:.4f}", flush=True)
+        print(f"  Fused-sum (A、B z-score 相加)   : {auc_sum:.4f}", flush=True)
+        print(f"  Fused-max (A、B z-score 取大)   : {auc_max:.4f}", flush=True)
+        print(f"  corr(A, B) z-score 相关系数     : {corr:.4f}  "
+              f"(诊断用,不参与打分决策)", flush=True)
         results["A"].append(auc_a)
         results["B"].append(auc_b)
-        results["Fused"].append(auc_fused)
+        results["Fused"].append(auc_sum)
+        results["FusedMax"].append(auc_max)
+        results["corr"].append(corr)
 
     lines = [
         f"# dual-branch BoW (global + independent foreground), obj={args.obj}, k={args.k}, "
@@ -228,17 +257,28 @@ def main():
         "variant                    mean     std      per-seed",
     ]
     for name, label in [("A", "A (全图词袋)"), ("B", "B (独立前景词袋)"),
-                        ("Fused", "Fused (A+B)")]:
+                        ("Fused", "Fused-sum (A+B)"), ("FusedMax", "Fused-max (A,B 取大)")]:
         arr = np.array(results[name])
         lines.append(f"{label:24s}  {arr.mean():.4f}  {arr.std():.4f}  "
                      f"[{', '.join(f'{a:.4f}' for a in arr)}]")
+    corr_arr = np.array(results["corr"])
+    lines.append(f"{'corr(A,B) 诊断':24s}  {corr_arr.mean():.4f}  {corr_arr.std():.4f}  "
+                 f"[{', '.join(f'{c:.4f}' for c in corr_arr)}]  (不参与打分决策)")
 
     lines.append("")
     lines.append("解读提示:")
     lines.append("  - A 必须先对上你已知的 pushpins 单类锚点(约0.70-0.73);对不上说明这份代码有 bug,")
     lines.append("    B/Fused 的数字先不要采信。")
     lines.append("  - B 单独的数字反映'前景词袋'本身有没有信号,和 A 无关。")
-    lines.append("  - Fused 若明显高于 max(A,B),说明两个分支抓到了互补信息,双分支值得留;")
+    lines.append("  - corr(A,B) 低说明 A 里有 B 抓不到的独立信息,只是融合方式没用好;")
+    lines.append("    corr(A,B) 高说明 B 基本就是'去噪版的 A',两分支本来就没有互补信息,")
+    lines.append("    融合难有起色,应该考虑直接弃用 A、只用 B。")
+    lines.append("  - Fused-max 若比 Fused-sum 好,说明问题出在'相加'这个融合方式本身")
+    lines.append("    (被弱分支的噪声拖累),不是双分支思路错了。")
+    lines.append("  - 若两种融合方式都不如 B,且 corr(A,B) 偏高,说明对 pushpins 这一类,")
+    lines.append("    A 分支没有增量价值,建议在 breakfast_box 上再跑一遍同样的对比——")
+    lines.append("    该类背景 AUROC 单独就有 0.95+,若那里 Fused 明显超过 B,说明")
+    lines.append("    '融合是否有效'取决于该类别背景是否携带真实信号,而不是融合方式本身不行。")
     lines.append("    若 Fused 接近 max(A,B),说明两分支冗余,加分支的复杂度不划算。")
 
     report = "\n".join(lines)
