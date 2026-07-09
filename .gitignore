@@ -1,4 +1,5 @@
 features_cache/
+features_cache_*/
 results/
 __pycache__/
 *.pyc
