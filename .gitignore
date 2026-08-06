@@ -5,3 +5,26 @@ third_party/
 results/
 __pycache__/
 *.pyc
+
+# Local datasets, weights, runtime caches, and experiment outputs.
+datasets/
+logs/
+torchinductor_*/
+*.log
+*.zip
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+.env
+.env.*
+!.env.example
+
+# Frozen baseline: keep code/config template, not machine-local paths/results.
+baseline/configs/*.local.yaml
+baseline/results/
+structural_patch_memory/**/logs/
+structural_patch_memory/**/results/
+relational_word_statistics/logs/
+relational_word_statistics/results/**/*.npz
+relational_word_statistics/results/**/*.csv

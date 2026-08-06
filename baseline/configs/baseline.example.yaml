@@ -1,0 +1,22 @@
+# Copy to baseline.local.yaml and edit paths. The local file is git-ignored.
+feature_cache: /path/to/dino_kmeans_logic/features_cache
+mask_cache: /path/to/dino_kmeans_logic/features_cache_fgmask
+s0_results: /path/to/dino_kmeans_logic/structural_patch_memory/results
+s1_results: /path/to/dino_kmeans_logic/structural_patch_memory/highres_backbone_ablation/results
+output_root: /path/to/output/current_baseline
+
+objects:
+  - breakfast_box
+  - juice_bottle
+  - pushpins
+  - screw_bag
+  - splicing_connectors
+seeds: [0, 1, 2, 3]
+
+k: 16
+kmeans_fit_subsample: 200000
+kmeans_batch_size: 4096
+foreground_fit_threshold: 0.5
+coverage_outlier_z: 2.5
+dirichlet_alpha: 0.5
+s_aggregation: top_1pct
